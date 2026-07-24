@@ -1,0 +1,6 @@
+/.vscode
+/data
+/outputs
+/river1d/__pycache__
+*.pyc
+.DS_Store
