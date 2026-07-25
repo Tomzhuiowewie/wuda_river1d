@@ -40,7 +40,7 @@ class RiverData:
         cross_section_path,
         device,
         dtype=torch.float32,
-        geometry_levels=512,
+        geometry_levels=1024,
     ):
         self.csv_path = Path(csv_path).expanduser().resolve()
         self.cross_section_path = Path(cross_section_path).expanduser().resolve()
