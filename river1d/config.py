@@ -13,8 +13,8 @@ class TrainConfig:
     # 2. 网络结构
     network_type: str = "mlp"
     # MLP：每个数是一个隐藏层宽度；Fourier-ResNet：元组长度是残差块数量。
-    hidden_layers: Tuple[int, ...] = (20,20,20,20,20,20)
-    activation: str = "tanh"
+    hidden_layers: Tuple[int, ...] = (64, 64, 64, 64)
+    activation: str = "gelu"
 
     # 3. Fourier-ResNet 网络专用参数
     fourier_features: int = 128
@@ -24,10 +24,10 @@ class TrainConfig:
     dropout: float = 0.0
 
     # 4. 训练与采样
-    epochs: int = 5000
+    epochs: int = 80000
     num_physics_points: int = 5000 # 每一轮训练采样多少物理点
     use_geometry_calibration: bool = False
-    learning_rate: float = 1.5e-5
+    learning_rate: float = 5.0e-5
     weight_decay: float = 1.0e-6
 
     # 学习率
@@ -42,10 +42,10 @@ class TrainConfig:
 
     # 5. 损失函数权重
     data_weight: float = 1.0    # 手工权重
-    z_weight: float = 5.0
-    q_weight: float = 1.0
+    z_weight: float = 1.0
+    q_weight: float = 5.0
 
-    physics_weight: float = 0.1
+    physics_weight: float = 8.0e-2
     mass_weight: float = 1.0
     momentum_weight: float = 1.0
 
@@ -56,7 +56,7 @@ class TrainConfig:
     ntk_max_weight: float = 1.0e2
 
     interior_section_count: int = 0
-    interior_section_ids: Tuple[int, ...] = ()
+    interior_section_ids: Tuple[int, ...] = (23, 46, 69)
     interior_data_weight: float = 1.0
 
     # 6. 运行、保存与复现
@@ -78,10 +78,12 @@ class TrainConfig:
 
 
 # 只在这里修改训练参数。
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 CONFIG = TrainConfig(
-    data_path=Path(__file__).resolve().parents[1] / "data/formodel/2024/FCSLPF.csv",
+    data_path=PROJECT_ROOT / "data/formodel/2024/FCSLPF.csv",
     cross_section_path=(
-        Path(__file__).resolve().parents[1]
+        PROJECT_ROOT
         / "data/1D_LYR_20260629/OUTPUT-2024汛期-东霞院-利津/OUTPUT/Qob5500.00/INICSProf.TXT"
     ),
 )

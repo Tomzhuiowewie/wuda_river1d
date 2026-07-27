@@ -123,8 +123,20 @@ def grid_metrics(model, data, start_time_index=0, end_time_index=None):
     z_pred, q_pred = model(x, t)
     area, width, _ = data.hydraulic_geometry(x, z_pred, t)
     h_pred = area / width.clamp_min(1.0e-6)
+    z_true = data.z_grid[start_time_index:end_time_index].reshape(-1)
     h_true = data.h_grid[start_time_index:end_time_index].reshape(-1)
     q_true = data.q_grid[start_time_index:end_time_index].reshape(-1)
+
     h_rel = torch.linalg.vector_norm(h_pred - h_true) / torch.linalg.vector_norm(h_true)
     q_rel = torch.linalg.vector_norm(q_pred - q_true) / torch.linalg.vector_norm(q_true)
-    return 100.0 * h_rel.item(), 100.0 * q_rel.item()
+
+    def nse(pred, true):
+        return 1.0 - ((pred - true).square().sum() / (true - true.mean()).square().sum()).item()
+
+    return (
+        100.0 * h_rel.item(),
+        100.0 * q_rel.item(),
+        nse(z_pred, z_true),
+        nse(h_pred, h_true),
+        nse(q_pred, q_true),
+    )

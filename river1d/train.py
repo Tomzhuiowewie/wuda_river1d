@@ -16,15 +16,9 @@ from _util import build_scheduler, choose_device, create_output_dir, grid_metric
 
 
 def stage_weights(epoch, total_epochs, dtype, device):
-    """三阶段权重：前期数据主导，中期平衡，后期增强 PDE。"""
-    progress = epoch / total_epochs
+    """强 PDE 权重：让 PDE loss 和 data loss 在训练后期接近同量级。"""
     data_weight = 1.0
-    if progress < 0.3:
-        physics_weight = 1.0e-3
-    elif progress < 0.7:
-        physics_weight = 1.0e-2
-    else:
-        physics_weight = 3.0e-2
+    physics_weight = 8.0e-2
     return (
         torch.tensor(data_weight, dtype=dtype, device=device),
         torch.tensor(physics_weight, dtype=dtype, device=device),
@@ -84,8 +78,9 @@ def train(config: TrainConfig):
     history_file = history_path.open("w", newline="", encoding="utf-8")
     fieldnames = ["epoch", "total_loss", "data_loss", "z_data_loss", "q_data_loss", "physics_loss", "mass_loss", "momentum_loss",
                   "data_weight", "physics_weight", "ntk_data_trace", "ntk_physics_trace", 
-                  "z_loss", "q_loss", "mass_loss_unweighted", "momentum_loss_unweighted", "train_h_l2_percent", 
-                  "train_q_l2_percent", "train_mean_l2_percent", "train_max_l2_percent", "learning_rate"]
+                  "z_loss", "q_loss", "mass_loss_unweighted", "momentum_loss_unweighted", "train_h_l2_percent",
+                  "train_q_l2_percent", "train_mean_l2_percent", "train_max_l2_percent",
+                  "train_z_nse", "train_h_nse", "train_q_nse", "learning_rate"]
     
     writer = csv.DictWriter(history_file, fieldnames=fieldnames)
     writer.writeheader()
@@ -148,7 +143,7 @@ def train(config: TrainConfig):
         should_report = epoch == 1 or epoch % config.print_every == 0 or epoch == config.epochs
         if should_report:
             model.eval()
-            train_h_l2, train_q_l2 = grid_metrics(model, data)
+            train_h_l2, train_q_l2, train_z_nse, train_h_nse, train_q_nse = grid_metrics(model, data)
             train_mean_l2 = 0.5 * (train_h_l2 + train_q_l2)
             train_max_l2 = max(train_h_l2, train_q_l2)
             row = {
@@ -172,6 +167,9 @@ def train(config: TrainConfig):
                 "train_q_l2_percent": train_q_l2,
                 "train_mean_l2_percent": train_mean_l2,
                 "train_max_l2_percent": train_max_l2,
+                "train_z_nse": train_z_nse,
+                "train_h_nse": train_h_nse,
+                "train_q_nse": train_q_nse,
                 "learning_rate": scheduler.get_last_lr()[0],
             }
             writer.writerow(row)
@@ -187,6 +185,7 @@ def train(config: TrainConfig):
                 f"z/q {z_term.item():7.1e}/{q_term.item():7.1e} | "
                 f"mass/mom {mass_loss.item():7.1e}/{momentum_loss.item():7.1e} | "
                 f"L2 {train_h_l2:4.1f}/{train_q_l2:4.1f}/{train_mean_l2:4.1f}% | "
+                f"NSE {train_z_nse:5.3f}/{train_h_nse:5.3f}/{train_q_nse:5.3f} | "
                 f"best {display_best_metric:4.1f}@{display_best_epoch} | "
                 f"{elapsed:4.1f}s"
             )

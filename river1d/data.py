@@ -117,15 +117,19 @@ class RiverData:
             raise ValueError(f"Variable {value!r} contains missing grid values")
         return self._tensor(table.to_numpy())
 
-    def initial_boundary_data(self, end_time_index):
+    def initial_boundary_data(self, time_mask=None):
+        """
+        初始条件 + 上下游边界条件
+        time_mask = None: 使用全部时间
+        time_mask = None: 只使用 time_mask=True
+
+        """
         x_initial = self.x_m
         t_initial = torch.full_like(x_initial, self.t_s[0])
 
-        if end_time_index is None:
-            t_boundary = self.t_s
-        else:
-            t_boundary = self.t_s[:end_time_index]
-        
+
+        t_boundary = self.t_s
+    
         x_left = torch.full_like(t_boundary, self.x_m[0])
         x_right = torch.full_like(t_boundary, self.x_m[-1])
 
