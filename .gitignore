@@ -4,3 +4,4 @@
 /river1d/__pycache__
 *.pyc
 .DS_Store
+/river1d/outputs
