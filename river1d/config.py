@@ -24,12 +24,11 @@ class TrainConfig:
     dropout: float = 0.0
 
     # 4. 训练与采样
-    epochs: int = 80000
-    num_physics_points: int = 5000 # 每一轮训练采样多少物理点
+    epochs: int = 30000
+    num_physics_points: int = 2000 # 每一轮训练采样多少物理点
     use_geometry_calibration: bool = False
     learning_rate: float = 5.0e-5
     weight_decay: float = 1.0e-6
-
     # 学习率
     scheduler_type: str = "warmup_exp"  # "cosine"、"warmup_exp"、"constant"
     warmup_epochs: int = 200

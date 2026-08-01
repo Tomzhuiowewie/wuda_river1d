@@ -5,3 +5,10 @@
 *.pyc
 .DS_Store
 /river1d/outputs
+/river1d/training_dataset
+/river1d/training_dataset_cache
+/training_dataset
+/river1d/.vscode
+*.ipynb
+*.csv
+*.npz

@@ -1,7 +1,6 @@
-"""
-多个独立流量过程共同训练一个条件 PINN。
 
-原来的 train.py、data.py、network.py 和 loss.py 保持不变。
+"""
+多个独立流量过程共同训练一个条件 PINN（一个过程划分多个过程）
 """
 
 from dataclasses import dataclass
@@ -9,6 +8,7 @@ import csv
 import json
 import time
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -17,6 +17,10 @@ from data import RiverData
 from loss import PINNResidual, data_loss
 from network import FlowNetwork, activations, initialize_weights
 from _util import build_scheduler, choose_device, create_output_dir, set_seed
+try:
+    from _geometry import CrossSectionGeometry
+except ImportError:
+    from ._geometry import CrossSectionGeometry
 
 
 # 1-based、首尾均包含。修改测试过程时只改 TEST_PROCESS_NAMES。
@@ -29,7 +33,10 @@ PROCESS_RANGES = {
     "P6": (681, 744),
 }
 TEST_PROCESS_NAMES = ("P4", "P6")
-BOUNDARY_WINDOW_HOURS = 24.0
+BOUNDARY_WINDOW_HOURS = 18.0
+BOUNDARY_LAG_HOURS = 33.0
+PROFILE_POINTS = 16
+PROFILE_FEATURE_DIM = 8
 
 
 @dataclass(frozen=True)
@@ -136,6 +143,26 @@ def sample_physics_points(data, process, count, time_fraction=1.0):
     return x, t
 
 
+def build_profile_table(cross_section_path, device, dtype):
+    """把每个静态断面高程重采样成固定长度，用作网络辅助输入。"""
+    sections = CrossSectionGeometry._read_profiles(cross_section_path)
+    rows = []
+    for section in sections:
+        lateral = section["x"]
+        elevation = section["z"]
+        if lateral.max() <= lateral.min():
+            sampled = np.full(PROFILE_POINTS, elevation.mean())
+        else:
+            target = np.linspace(lateral.min(), lateral.max(), PROFILE_POINTS)
+            sampled = np.interp(target, lateral, elevation)
+        rows.append(sampled)
+
+    table = torch.as_tensor(np.stack(rows), dtype=dtype, device=device)
+    mean = table.mean()
+    scale = table.std().clamp_min(1.0e-6)
+    return (table - mean) / scale
+
+
 class ProcessGeometryAdapter:
     """只把局部时间还原成绝对时间，其余数据接口仍使用 RiverData。"""
 
@@ -152,7 +179,7 @@ class ProcessGeometryAdapter:
 
 
 class ProcessFlowNetwork(FlowNetwork):
-    """共享 MLP：输入 x、局部时间、初始状态和当前过程边界。"""
+    """共享 MLP：输入 x、局部时间、初始状态、历史边界和静态断面。"""
 
     def __init__(self, data, config, train_processes):
         super().__init__(
@@ -164,15 +191,45 @@ class ProcessFlowNetwork(FlowNetwork):
         )
         self.current_process = None
         self.window_seconds = BOUNDARY_WINDOW_HOURS * 3600.0
+        self.lag_seconds = BOUNDARY_LAG_HOURS * 3600.0
+        self.register_buffer(
+            "profile_table",
+            build_profile_table(data.cross_section_path, data.device, data.dtype),
+        )
 
-        # x, tau, Z0(x), Q0(x), 8 个边界特征。
+        activation = activations[config.activation]
+
+        # 先创建一次不含 profile 的 26 维网络，保持与之前最佳临时脚本
+        # RatioWithGeoNetwork(Shape3EnhanceNetwork) 相同的随机初始化顺序。
         widths = list(config.hidden_layers)
         layers = []
-        in_features = 12
+        in_features = 2 + 2 + 2 + 4 + 4 + 8 + 4
         for out_features in widths:
             layers.extend((
                 nn.Linear(in_features, out_features),
-                activations[config.activation](),
+                activation(),
+            ))
+            if config.dropout > 0:
+                layers.append(nn.Dropout(config.dropout))
+            in_features = out_features
+        layers.append(nn.Linear(in_features, 2))
+        self.network = nn.Sequential(*layers)
+        initialize_weights(self)
+
+        self.profile_encoder = nn.Sequential(
+            nn.Linear(PROFILE_POINTS, 32),
+            activation(),
+            nn.Linear(32, PROFILE_FEATURE_DIM),
+            activation(),
+        )
+
+        # x,tau 2 个；Z0,Q0 2 个；历史边界 22 个；断面 profile 编码 8 个。
+        layers = []
+        in_features = 2 + 2 + 22 + PROFILE_FEATURE_DIM
+        for out_features in widths:
+            layers.extend((
+                nn.Linear(in_features, out_features),
+                activation(),
             ))
             if config.dropout > 0:
                 layers.append(nn.Dropout(config.dropout))
@@ -257,7 +314,19 @@ class ProcessFlowNetwork(FlowNetwork):
     def _normalise(self, value, low, value_range):
         return 2.0 * (value - low) / value_range - 1.0
 
-    def _boundary_features(self, local_t):
+    def _profile_at_x(self, x):
+        index = torch.searchsorted(
+            self.x_grid.contiguous(), x.contiguous(), right=True
+        ) - 1
+        index = index.clamp(0, self.x_grid.numel() - 2)
+        x0, x1 = self.x_grid[index], self.x_grid[index + 1]
+        weight = ((x - x0) / (x1 - x0)).unsqueeze(-1)
+        return (
+            (1.0 - weight) * self.profile_table[index]
+            + weight * self.profile_table[index + 1]
+        )
+
+    def _boundary_features(self, x, local_t):
         process = self.current_process
         start = local_t.new_tensor(process.start_time_s)
         end = local_t.new_tensor(process.end_time_s)
@@ -266,27 +335,60 @@ class ProcessFlowNetwork(FlowNetwork):
         _, z_now, q_now, _ = self.data.boundary_values(absolute_t)
         previous_t = torch.maximum(absolute_t - self.dt_seconds, start)
         _, z_previous, q_previous, _ = self.data.boundary_values(previous_t)
-
         window_t = torch.maximum(
             absolute_t - local_t.new_tensor(self.window_seconds),
             start,
         )
         _, z_window, q_window, _ = self.data.boundary_values(window_t)
+        lag_t = torch.maximum(
+            absolute_t - local_t.new_tensor(self.lag_seconds),
+            start,
+        )
+        _, z_lag, q_lag, _ = self.data.boundary_values(lag_t)
+
+        z0, q0 = self._state_at_x(x)
+        eps = local_t.new_tensor(1.0e-6)
+
+        q_now_n = self._normalise(q_now, self.q_up_min, self.q_up_range)
+        z_now_n = self._normalise(z_now, self.z_down_min, self.z_down_range)
+        q_window_n = self._normalise(q_window, self.q_up_min, self.q_up_range)
+        z_window_n = self._normalise(z_window, self.z_down_min, self.z_down_range)
+        q_lag_n = self._normalise(q_lag, self.q_up_min, self.q_up_range)
+        z_lag_n = self._normalise(z_lag, self.z_down_min, self.z_down_range)
 
         return torch.stack((
-            self._normalise(q_now, self.q_up_min, self.q_up_range),
-            self._normalise(z_now, self.z_down_min, self.z_down_range),
-            (q_now - q_previous) / self.dt_seconds / self.dq_scale,
-            (z_now - z_previous) / self.dt_seconds / self.dz_scale,
-            self._normalise(
-                0.5 * (q_now + q_window), self.q_up_min, self.q_up_range
-            ),
-            self._normalise(
-                0.5 * (z_now + z_window), self.z_down_min, self.z_down_range
-            ),
-            (q_now - q_window) / self.q_up_range,
-            (z_now - z_window) / self.z_down_range,
-        ), dim=-1)
+            # 当前边界。
+            q_now_n,
+            z_now_n,
+
+            # 33h 滞后边界及当前-滞后差。
+            q_lag_n,
+            z_lag_n,
+            (q_now - q_lag) / self.q_up_range,
+            (z_now - z_lag) / self.z_down_range,
+
+            # 当前变化率方向。
+            (q_now - q_previous) / self.q_up_range,
+            (z_now - z_previous) / self.z_down_range,
+            torch.sign(q_now - q_previous),
+            torch.sign(z_now - z_previous),
+
+            # 18h、33h、当前三点形态。
+            q_window_n,
+            q_lag_n,
+            z_window_n,
+            z_lag_n,
+            q_now_n - q_window_n,
+            q_now_n - q_lag_n,
+            z_now_n - z_window_n,
+            z_now_n - z_lag_n,
+
+            # 当前边界相对初始状态和历史边界的比例。
+            (q_now - q0) / self.data.scales.discharge_m3_s,
+            (z_now - z0) / self.data.scales.depth_m,
+            (q_now - q_window) / (q_now.abs() + eps),
+            (q_now - q_lag) / (q_now.abs() + eps),
+        ), dim=-1).clamp(-10.0, 10.0)
 
     def _features(self, x, t, x_hat, t_hat):
         z0, q0 = self._state_at_x(x)
@@ -294,11 +396,13 @@ class ProcessFlowNetwork(FlowNetwork):
             (z0 - self.data.scales.water_level_m) / self.data.scales.depth_m,
             q0 / self.data.scales.discharge_m3_s,
         ), dim=-1)
+        profile_features = self.profile_encoder(self._profile_at_x(x))
         return torch.cat((
             torch.stack((x_hat, t_hat), dim=-1),
             initial_features,
-            self._boundary_features(t),
-        ), dim=-1)
+            self._boundary_features(x, t),
+            profile_features,
+        ), dim=-1).clamp(-10.0, 10.0)
 
 
 @torch.no_grad()
@@ -364,6 +468,9 @@ def save_model(path, model, optimizer, scheduler, epoch, config, best_metric):
         "process_ranges": PROCESS_RANGES,
         "test_processes": TEST_PROCESS_NAMES,
         "boundary_window_hours": BOUNDARY_WINDOW_HOURS,
+        "boundary_lag_hours": BOUNDARY_LAG_HOURS,
+        "profile_points": PROFILE_POINTS,
+        "profile_feature_dim": PROFILE_FEATURE_DIM,
         "best_metric": best_metric,
     }, path)
 
@@ -413,7 +520,13 @@ def train_flow_generalization(config=CONFIG):
         "test_processes": [p.name for p in test_processes],
         "process_ranges": PROCESS_RANGES,
         "boundary_window_hours": BOUNDARY_WINDOW_HOURS,
-        "network_inputs": ["x", "tau", "z0_x", "q0_x", "boundary_features"],
+        "boundary_lag_hours": BOUNDARY_LAG_HOURS,
+        "profile_points": PROFILE_POINTS,
+        "profile_feature_dim": PROFILE_FEATURE_DIM,
+        "network_inputs": [
+            "x", "tau", "z0_x", "q0_x",
+            "boundary_history_ratio", "static_cross_section_profile",
+        ],
     })
     with (output_dir / "config.json").open("w", encoding="utf-8") as file:
         json.dump(experiment_config, file, ensure_ascii=False, indent=2)
@@ -435,7 +548,8 @@ def train_flow_generalization(config=CONFIG):
     print(
         f"device={device} train={[p.name for p in train_processes]} "
         f"test={[p.name for p in test_processes]} "
-        f"inputs=x,tau,Z0(x),Q0(x),boundary "
+        f"inputs=x,tau,Z0(x),Q0(x),history_ratio,static_profile "
+        f"window={BOUNDARY_WINDOW_HOURS:g}h lag={BOUNDARY_LAG_HOURS:g}h "
         f"physics_points/epoch={config.num_physics_points}"
     )
 

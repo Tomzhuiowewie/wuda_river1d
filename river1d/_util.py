@@ -44,8 +44,6 @@ def set_seed(seed: int) -> None:
 
 
 
-
-
 def build_scheduler(optimizer, config):
     if config.scheduler_type == "cosine":
         return torch.optim.lr_scheduler.CosineAnnealingLR(
