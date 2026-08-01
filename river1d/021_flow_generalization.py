@@ -870,7 +870,7 @@ def train_operator_pinn(
     epochs=1000,
     data_section_indices=None,
     physics_batch_size=512,
-    scenarios_per_epoch=8,
+    scenarios_per_batch=8,
     eval_every=500,
     save_every=500,
     initial_weight=1.0,
@@ -897,7 +897,8 @@ def train_operator_pinn(
             None if data_section_indices is None else list(data_section_indices)
         ),
         "physics_batch_size": physics_batch_size,
-        "scenarios_per_epoch": scenarios_per_epoch,
+        "scenarios_per_batch": scenarios_per_batch,
+        "batches_per_epoch": int(np.ceil(len(train_files) / scenarios_per_batch)),
         "eval_every": eval_every,
         "save_every": save_every,
         "initial_weight": initial_weight,
@@ -915,6 +916,8 @@ def train_operator_pinn(
     fieldnames = [
         "epoch",
         "loss",
+        "scenario_count",
+        "batch_count",
         "initial_loss",
         "boundary_loss",
         "data_loss",
@@ -943,7 +946,6 @@ def train_operator_pinn(
 
     for epoch in range(1, epochs + 1):
         model.train()
-        optimizer.zero_grad()
 
         epoch_losses = []
         epoch_initial_losses = []
@@ -958,89 +960,94 @@ def train_operator_pinn(
         epoch_mass_losses = []
         epoch_momentum_losses = []
 
-        # 每个 epoch 随机抽多个独立流量过程，取平均 loss。
-        selected_files = np.random.choice(
-            train_files,
-            size=min(scenarios_per_epoch, len(train_files)),
-            replace=False,
-        )
+        shuffled_files = np.random.permutation(train_files)
+        batch_count = 0
 
-        for path in selected_files:
-            scenario = dataset.load(path)
+        for start in range(0, len(shuffled_files), scenarios_per_batch):
+            selected_files = shuffled_files[start:start + scenarios_per_batch]
+            batch_count += 1
 
-            # 当前 scenario 的条件向量
-            condition = dataset.condition_vector(path)
-            condition_norm = normalizer.transform(condition)
-            c = to_tensor(condition_norm)
+            optimizer.zero_grad()
+            batch_losses = []
 
-            initial_loss, initial_z_loss, initial_q_loss = supervised_loss(
-                model,
-                scales,
-                c,
-                initial_condition_data(scenario),
-            )
-            boundary_loss, boundary_z_loss, boundary_q_loss = supervised_loss(
-                model,
-                scales,
-                c,
-                boundary_condition_data(scenario),
-            )
-            data_loss, data_z_loss, data_q_loss = supervised_loss(
-                model,
-                scales,
-                c,
-                section_observation_data(
+            for path in selected_files:
+                scenario = dataset.load(path)
+
+                # 当前 scenario 的条件向量
+                condition = dataset.condition_vector(path)
+                condition_norm = normalizer.transform(condition)
+                c = to_tensor(condition_norm)
+
+                initial_loss, initial_z_loss, initial_q_loss = supervised_loss(
+                    model,
+                    scales,
+                    c,
+                    initial_condition_data(scenario),
+                )
+                boundary_loss, boundary_z_loss, boundary_q_loss = supervised_loss(
+                    model,
+                    scales,
+                    c,
+                    boundary_condition_data(scenario),
+                )
+                data_loss, data_z_loss, data_q_loss = supervised_loss(
+                    model,
+                    scales,
+                    c,
+                    section_observation_data(
+                        scenario,
+                        section_indices=data_section_indices,
+                    ),
+                )
+
+                x_phys_np, t_phys_np = sample_physics_batch(
                     scenario,
-                    section_indices=data_section_indices,
-                ),
-            )
+                    batch_size=physics_batch_size,
+                )
+                mass_loss, momentum_loss = pde_residual.loss(
+                    model,
+                    to_tensor(x_phys_np),
+                    to_tensor(t_phys_np),
+                    c,
+                )
 
-            x_phys_np, t_phys_np = sample_physics_batch(
-                scenario,
-                batch_size=physics_batch_size,
-            )
-            mass_loss, momentum_loss = pde_residual.loss(
-                model,
-                to_tensor(x_phys_np),
-                to_tensor(t_phys_np),
-                c,
-            )
+                physics_loss = (
+                    mass_weight * torch.log1p(mass_loss)
+                    + momentum_weight * torch.log1p(momentum_loss)
+                )
+                physics_factor = min(1.0, epoch / max(1, physics_warmup_epochs))
+                effective_physics_weight = physics_weight * physics_factor
+                scenario_loss = (
+                    initial_weight * initial_loss
+                    + boundary_weight * boundary_loss
+                    + data_weight * data_loss
+                    + effective_physics_weight * physics_loss
+                )
 
-            physics_loss = (
-                mass_weight * torch.log1p(mass_loss)
-                + momentum_weight * torch.log1p(momentum_loss)
-            )
-            physics_factor = min(1.0, epoch / max(1, physics_warmup_epochs))
-            effective_physics_weight = physics_weight * physics_factor
-            loss = (
-                initial_weight * initial_loss
-                + boundary_weight * boundary_loss
-                + data_weight * data_loss
-                + effective_physics_weight * physics_loss
-            )
+                batch_losses.append(scenario_loss)
+                epoch_initial_losses.append(initial_loss.detach())
+                epoch_boundary_losses.append(boundary_loss.detach())
+                epoch_data_losses.append(data_loss.detach())
+                epoch_initial_z_losses.append(initial_z_loss.detach())
+                epoch_initial_q_losses.append(initial_q_loss.detach())
+                epoch_boundary_z_losses.append(boundary_z_loss.detach())
+                epoch_boundary_q_losses.append(boundary_q_loss.detach())
+                epoch_data_z_losses.append(data_z_loss.detach())
+                epoch_data_q_losses.append(data_q_loss.detach())
+                epoch_mass_losses.append(mass_loss.detach())
+                epoch_momentum_losses.append(momentum_loss.detach())
 
-            epoch_losses.append(loss)
-            epoch_initial_losses.append(initial_loss.detach())
-            epoch_boundary_losses.append(boundary_loss.detach())
-            epoch_data_losses.append(data_loss.detach())
-            epoch_initial_z_losses.append(initial_z_loss.detach())
-            epoch_initial_q_losses.append(initial_q_loss.detach())
-            epoch_boundary_z_losses.append(boundary_z_loss.detach())
-            epoch_boundary_q_losses.append(boundary_q_loss.detach())
-            epoch_data_z_losses.append(data_z_loss.detach())
-            epoch_data_q_losses.append(data_q_loss.detach())
-            epoch_mass_losses.append(mass_loss.detach())
-            epoch_momentum_losses.append(momentum_loss.detach())
-
-        loss = torch.stack(epoch_losses).mean()
-        loss.backward()
-        if grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        optimizer.step()
+            batch_loss = torch.stack(batch_losses).mean()
+            batch_loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+            epoch_losses.append(batch_loss.detach())
 
         should_print_loss = epoch == 1 or epoch % 100 == 0
         should_evaluate = epoch == 1 or epoch % eval_every == 0 or epoch == epochs
 
+        loss_value = torch.stack(epoch_losses).mean().item()
         initial_loss_value = torch.stack(epoch_initial_losses).mean().item()
         boundary_loss_value = torch.stack(epoch_boundary_losses).mean().item()
         data_loss_value = torch.stack(epoch_data_losses).mean().item()
@@ -1056,14 +1063,15 @@ def train_operator_pinn(
         if should_print_loss:
             print(
                 f"epoch {epoch:5d} | "
-                f"loss {loss.item():.4e} | "
+                f"loss {loss_value:.4e} | "
                 f"IC {initial_loss_value:.2e} | "
                 f"BC {boundary_loss_value:.2e} | "
                 f"Data {data_loss_value:.2e} | "
                 f"mass {mass_loss_value:.2e} | "
                 f"mom {momentum_loss_value:.2e} | "
                 f"pw {effective_physics_weight:.1e} | "
-                f"scenarios {len(selected_files)}"
+                f"scenarios {len(train_files)} | "
+                f"batches {batch_count}"
                 ,
                 flush=True,
             )
@@ -1117,7 +1125,9 @@ def train_operator_pinn(
         if should_print_loss or should_evaluate:
             row = {
                 "epoch": epoch,
-                "loss": loss.item(),
+                "loss": loss_value,
+                "scenario_count": len(train_files),
+                "batch_count": batch_count,
                 "initial_loss": initial_loss_value,
                 "boundary_loss": boundary_loss_value,
                 "data_loss": data_loss_value,
@@ -1227,10 +1237,9 @@ def main():
         epochs=2000,
         data_section_indices=data_section_indices,
         physics_batch_size=256,
-        scenarios_per_epoch=8,
+        scenarios_per_batch=8,
         eval_every=500,
         save_every=500,
-
         initial_weight=1.0,
         boundary_weight=1.0,
         data_weight=1.0,
