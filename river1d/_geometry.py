@@ -13,10 +13,10 @@ class CrossSectionGeometry:
     def __init__(self, profile_path, x_m, device="cpu", dtype=torch.float32, levels=1024):
         sections = self._read_profiles(profile_path)
 
-        minimum_z = np.array([section["z"].min() for section in sections])
-        maximum_z = np.array([section["z"].max() for section in sections])
-        z_min = min(section["z"].min() for section in sections)
-        z_max = max(section["z"].max() for section in sections)
+        # HEC-RAS 的 total flow area 包含主槽和滩地；flag 仅用于分类，
+        minimum_z = np.asarray([section["z"].min() for section in sections])
+        maximum_z = np.asarray([section["z"].max() for section in sections])
+        z_min, z_max = float(minimum_z.min()), float(maximum_z.max())
         z_levels = np.linspace(z_min - 0.5, z_max + 1.0, levels)
 
         area = np.empty((len(sections), levels))
@@ -35,6 +35,7 @@ class CrossSectionGeometry:
 
     @staticmethod
     def _read_profiles(profile_path):
+        """读取 HEC-RAS 断面文件，返回断面列表，每个断面包含 section_id、distance_m、x、z、flag。"""
         lines = Path(profile_path).expanduser().resolve().read_text().splitlines()
         sections = []
         i = 0
@@ -66,11 +67,13 @@ class CrossSectionGeometry:
 
     @staticmethod
     def _rating_curve(section, water_levels):
+        """计算断面在不同水位下的过流面积、表宽和湿周。"""
         x0 = section["x"][:-1]
         x1 = section["x"][1:]
         z0 = section["z"][:-1]
         z1 = section["z"][1:]
-        active = (section["flag"][:-1] == 0) & (section["flag"][1:] == 0)
+        # 匹配 HEC-RAS 的 total flow area，所有断面线段都参与积分。
+        active = np.ones_like(x0, dtype=bool)
 
         dx = x1 - x0    # 线段长度
         segment_length = np.hypot(dx, z1 - z0)  # 斜边长度
@@ -94,41 +97,28 @@ class CrossSectionGeometry:
         area = np.sum(0.5 * (wet0 + wet1) * dx[None, :] * fraction, axis=1)
         return area, width, perimeter
 
-    def _space_indices(self, x):
-        index = torch.searchsorted(self.x_m.contiguous(), x.contiguous(), right=True) - 1
-        return index.clamp(0, self.x_m.numel() - 2)
-
-    def _level_indices(self, water_level):
-        index = torch.searchsorted(self.z_levels.contiguous(), water_level.contiguous(), right=True) - 1
-        return index.clamp(0, self.z_levels.numel() - 2)
-
-    def minimum_stage(self, x_m):
-        """断面点最低绝对高程"""
+    def stage_bounds(self, x_m):
+        """返回位置 x_m 对应断面的最低、最高高程。"""
         shape = x_m.shape
         x = x_m.reshape(-1).clamp(self.x_m[0], self.x_m[-1])
-        ix = self._space_indices(x)
+        ix = torch.searchsorted(self.x_m.contiguous(), x.contiguous(), right=True) - 1
+        ix = ix.clamp(0, self.x_m.numel() - 2)
         wx = (x - self.x_m[ix]) / (self.x_m[ix + 1] - self.x_m[ix])
-        value = (1.0 - wx) * self.minimum_z[ix] + wx * self.minimum_z[ix + 1]
-        return value.reshape(shape)
-
-    def maximum_stage(self, x_m):
-        """断面点最高绝对高程。"""
-        shape = x_m.shape
-        x = x_m.reshape(-1).clamp(self.x_m[0], self.x_m[-1])
-        ix = self._space_indices(x)
-        wx = (x - self.x_m[ix]) / (self.x_m[ix + 1] - self.x_m[ix])
-        value = (1.0 - wx) * self.maximum_z[ix] + wx * self.maximum_z[ix + 1]
-        return value.reshape(shape)
+        lower = (1.0 - wx) * self.minimum_z[ix] + wx * self.minimum_z[ix + 1]
+        upper = (1.0 - wx) * self.maximum_z[ix] + wx * self.maximum_z[ix + 1]
+        return lower.reshape(shape), upper.reshape(shape)
 
     def __call__(self, x_m, water_level, t_s=None):
         shape = torch.broadcast_shapes(x_m.shape, water_level.shape)
         x = x_m.expand(shape).reshape(-1).clamp(self.x_m[0], self.x_m[-1])
         z = water_level.expand(shape).reshape(-1)
-        ix = self._space_indices(x)
+        ix = torch.searchsorted(self.x_m.contiguous(), x.contiguous(), right=True) - 1
+        ix = ix.clamp(0, self.x_m.numel() - 2)
         wx = (x - self.x_m[ix]) / (self.x_m[ix + 1] - self.x_m[ix])
 
         z = z.clamp(self.z_levels[0], self.z_levels[-1])
-        iz = self._level_indices(z)
+        iz = torch.searchsorted(self.z_levels.contiguous(), z.contiguous(), right=True) - 1
+        iz = iz.clamp(0, self.z_levels.numel() - 2)
         wz = (z - self.z_levels[iz]) / (self.z_levels[iz + 1] - self.z_levels[iz])
 
         def interpolate(table):
@@ -143,7 +133,8 @@ class CrossSectionGeometry:
         shape = torch.broadcast_shapes(x_m.shape, area.shape)
         x = x_m.expand(shape).reshape(-1).clamp(self.x_m[0], self.x_m[-1])
         a = area.expand(shape).reshape(-1)
-        ix = self._space_indices(x)
+        ix = torch.searchsorted(self.x_m.contiguous(), x.contiguous(), right=True) - 1
+        ix = ix.clamp(0, self.x_m.numel() - 2)
         wx = (x - self.x_m[ix]) / (self.x_m[ix + 1] - self.x_m[ix])
 
         area_curve = (

@@ -86,8 +86,9 @@ class FlowNetwork(nn.Module):
         q_min = interpolate_by_x(self, x, self.q_min_curve)
         q_max = interpolate_by_x(self, x, self.q_max_curve)
 
-        z_lower = torch.maximum(self.geometry.minimum_stage(x) + 1.0e-3, z_min)
-        z_upper = torch.minimum(self.geometry.maximum_stage(x), z_max)
+        z_bed, z_top = self.geometry.stage_bounds(x)
+        z_lower = torch.maximum(z_bed + 1.0e-3, z_min)
+        z_upper = torch.minimum(z_top, z_max)
         z_upper = torch.maximum(z_upper, z_lower + 1.0e-3)
 
         z = z_lower + (z_upper - z_lower) * torch.sigmoid(raw[:, 0])
@@ -115,8 +116,8 @@ class AreaDischargeFlowNetwork(FlowNetwork):
     def forward(self, x_m, t_s):
         shape, x, t, x_hat, t_hat = self._coordinates(x_m, t_s)
         raw = self.network(self._features(x, t, x_hat, t_hat))
-        z_lower = self.geometry.minimum_stage(x) + 0.05
-        z_upper = self.geometry.maximum_stage(x)
+        z_lower, z_upper = self.geometry.stage_bounds(x)
+        z_lower = z_lower + 0.05
         z_upper = torch.maximum(z_upper, z_lower + 1.0e-3)
         area_lower, _, _ = self.geometry(x, z_lower)
         area_upper, _, _ = self.geometry(x, z_upper)
@@ -201,8 +202,9 @@ class FourierResNetFlowNetwork(nn.Module):
         q_min = interpolate_by_x(self, x_flat, self.q_min_curve)
         q_max = interpolate_by_x(self, x_flat, self.q_max_curve)
 
-        z_lower = torch.maximum(self.geometry.minimum_stage(x_flat) + 1.0e-3, z_min)
-        z_upper = torch.minimum(self.geometry.maximum_stage(x_flat), z_max)
+        z_bed, z_top = self.geometry.stage_bounds(x_flat)
+        z_lower = torch.maximum(z_bed + 1.0e-3, z_min)
+        z_upper = torch.minimum(z_top, z_max)
         z_upper = torch.maximum(z_upper, z_lower + 1.0e-3)
         z = z_lower + (z_upper - z_lower) * torch.sigmoid(z_raw)
         z = torch.minimum(torch.maximum(z, z_lower), z_upper)

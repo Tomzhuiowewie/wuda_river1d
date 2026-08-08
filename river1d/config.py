@@ -77,12 +77,13 @@ class TrainConfig:
 
 
 # 只在这里修改训练参数。
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# ``config.py`` is in ``<project>/river1d``; parents[1] is the project root.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 CONFIG = TrainConfig(
     data_path=PROJECT_ROOT / "data/formodel/2024/FCSLPF.csv",
     cross_section_path=(
         PROJECT_ROOT
-        / "data/1D_LYR_20260629/OUTPUT-2024汛期-东霞院-利津/OUTPUT/Qob5500.00/INICSProf.TXT"
+        / "data/INICSProf.TXT"
     ),
 )
