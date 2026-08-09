@@ -35,7 +35,7 @@ class TrainingOptions:
     epochs: int = 300
     scenarios_per_batch: int = 4
     physics_points: int = 512
-    learning_rate: float = 3.0e-4
+    learning_rate: float = 1.0e-3
     grad_clip: float = 1.0
     # 监督点断面索引
     supervised_section_indices: tuple = (23, 46, 69)
@@ -48,9 +48,11 @@ class TrainingOptions:
     momentum_weight: float = 1.0
     # 适应性权重更新
     adaptive_weighting: bool = True
-    # 先使用固定权重训练若干 epoch，再开启自适应更新
-    fixed_weight_epochs: int = 30
-    weight_update_start: int = 30
+    # 第 1 个 epoch 结束后根据各项初始损失自动标定权重；此后先固定预热
+    # 若干 epoch，再从固定阶段结束后进行 GradNorm 自适应更新。
+    auto_initialize_weights: bool = True
+    fixed_weight_epochs: int = 100
+    weight_update_start: int = 101
     weight_update_every: int = 30
     weight_update_rate: float = 0.2
     min_loss_weight: float = 0.01
@@ -234,29 +236,40 @@ class PDE:
 
 # ============================== 训练 ==============================
 def supervised_points(scenario, kind, section_indices=(23, 46, 69)):
-    """返回初始、边界或内部断面监督点"""
+    """返回初始或内部断面监督点。"""
     x, t, z, q = scenario["x"], scenario["t"], scenario["z"], scenario["q"]
     if kind == "initial":
         return x, np.full_like(x, t[0]), z[0], q[0]
-    if kind == "boundary":
-        tb = np.concatenate((t, t))
-        xb = np.concatenate((np.full_like(t, x[0]), np.full_like(t, x[-1])))
-        return xb, tb, np.concatenate((z[:, 0], z[:, -1])), np.concatenate((q[:, 0], q[:, -1]))
     selected_x, selected_t = np.meshgrid(x[list(section_indices)], t, indexing="xy")
     return selected_x.ravel(), selected_t.ravel(), z[:, list(section_indices)].ravel(), q[:, list(section_indices)].ravel()
 
 
 def loss_for_scenario(model, pde, scenario, condition, options):
     """计算单个场景的初始、边界、数据及物理约束损失"""
+    z_scale = max(model.scales.z_std, 1.0e-6)
+    q_scale = max(model.scales.q_std, 1.0e-6)
+
     losses = []
-    for kind in ("initial", "boundary", "sections"):
+    for kind in ("initial", "sections"):
         x, t, z, q = supervised_points(scenario, kind, options.supervised_section_indices)
         zp, qp = model(to_tensor(x), to_tensor(t), condition)
         losses.append(
-            ((zp - to_tensor(z)) ** 2).mean() + ((qp - to_tensor(q)) ** 2).mean()
+            (((zp - to_tensor(z)) / z_scale) ** 2).mean()
+            + (((qp - to_tensor(q)) / q_scale) ** 2).mean()
         )
-        
-    initial_loss, boundary_loss, data_loss = losses
+
+    initial_loss, data_loss = losses
+
+    # 一维浅水方程只使用已知的两个外边界：上游流量 Q、下游水位 Z。
+    t_boundary = to_tensor(scenario["t"])
+    upstream_x = to_tensor(np.full_like(scenario["t"], scenario["x"][0]))
+    downstream_x = to_tensor(np.full_like(scenario["t"], scenario["x"][-1]))
+    _, upstream_q = model(upstream_x, t_boundary, condition)
+    downstream_z, _ = model(downstream_x, t_boundary, condition)
+    boundary_loss = (
+        (((upstream_q - to_tensor(scenario["q"][:, 0])) / q_scale) ** 2).mean()
+        + (((downstream_z - to_tensor(scenario["z"][:, -1])) / z_scale) ** 2).mean()
+    )
 
     # 随机采样时空点，计算质量守恒和动量守恒损失
     x = scenario["x"][0] + (scenario["x"][-1] - scenario["x"][0]) * np.random.rand(options.physics_points)
@@ -301,16 +314,18 @@ def update_gradnorm_weights(component_losses, loss_weights, model, learning_rate
 
 
 @torch.no_grad()
-def evaluate(model, dataset, condition_standardizer, scenario_paths, count=32, points_per_scenario=1024):
-    """在随机采样的场景和时空点上评估水位、流量预测误差及 NSE"""
-    selected_paths = scenario_paths if len(scenario_paths) <= count else np.random.choice(scenario_paths, count, replace=False)
+def evaluate(model, dataset, condition_standardizer, scenario_paths, count=32, points_per_scenario=1024, seed=0):
+    """在固定采样的场景和时空点上评估水位、流量预测误差及 NSE。"""
+    model.eval()
+    rng = np.random.default_rng(seed)
+    selected_paths = scenario_paths if len(scenario_paths) <= count else rng.choice(scenario_paths, count, replace=False)
     predicted_water_levels, predicted_discharges = [], []
     true_water_levels, true_discharges = [], []
     for scenario_path in selected_paths:
         scenario = dataset.load_scenario(scenario_path)
         point_count = min(points_per_scenario, scenario["x"].size * scenario["t"].size)
-        time_indices = np.random.randint(0, len(scenario["t"]), point_count)
-        space_indices = np.random.randint(0, len(scenario["x"]), point_count)
+        time_indices = rng.integers(0, len(scenario["t"]), point_count)
+        space_indices = rng.integers(0, len(scenario["x"]), point_count)
         condition = condition_standardizer.transform(dataset.get_condition_vector(scenario_path))
         predicted_z, predicted_q = model(
             to_tensor(scenario["x"][space_indices]),
@@ -344,11 +359,6 @@ def train(model, pde, dataset, condition_standardizer, options, output_directory
         dtype=torch.float32,
         device=compute_device,
     )
-    # 固定阶段使用配置中的权重；先限制在允许范围内并归一化，
-    # 保证初始总权重为损失项数量，避免某一项因配置失误直接支配训练。
-    with torch.no_grad():
-        loss_weights.clamp_(min=options.min_loss_weight, max=options.max_loss_weight)
-        loss_weights.mul_(loss_weights.numel() / loss_weights.sum().clamp_min(1.0e-12))
 
     history = (output_directory / "history.csv").open("w", newline="", encoding="utf-8")
     writer = csv.writer(history)
@@ -362,9 +372,15 @@ def train(model, pde, dataset, condition_standardizer, options, output_directory
     )
 
     best_q_nse = -float("inf")
+    loss_scales = None if options.auto_initialize_weights else torch.ones(
+        5, dtype=torch.float32, device=compute_device
+    )
+    adaptive_start_epoch = max(options.fixed_weight_epochs + 1, options.weight_update_start)
     # ============================== 训练循环 ==============================
     for epoch in range(1, options.epochs + 1):
         model.train()
+        # 固定本 epoch 使用的基准，避免第 1 个 epoch 结束时更新基准后影响当期日志。
+        epoch_loss_scales = loss_scales
         shuffled_scenario_paths = np.random.permutation(dataset.train_files)    # 随机打乱训练场景顺序，按批次训练
 
         scenario_loss_terms, weighted_loss_terms = [], []   # 场景损失项、加权损失项
@@ -385,40 +401,55 @@ def train(model, pde, dataset, condition_standardizer, options, output_directory
                 batch_component_losses.append(terms)
 
             component_losses = torch.stack(batch_component_losses).mean(0)  # 批次中每个场景的损失项平均值
+            objective_losses = (
+                component_losses
+                if epoch_loss_scales is None
+                else component_losses / epoch_loss_scales
+            )
 
             if (
                 options.adaptive_weighting
-                and epoch > options.fixed_weight_epochs
-                and epoch >= options.weight_update_start
-                and epoch % options.weight_update_every == 0
+                and epoch >= adaptive_start_epoch
+                # 第一个自适应 epoch 更新一次，之后按周期更新。
+                and (epoch - adaptive_start_epoch) % options.weight_update_every == 0
                 and start == 0
             ):
                 update_gradnorm_weights(
-                    component_losses, loss_weights, model,
+                    objective_losses, loss_weights, model,
                     options.weight_update_rate,
                     options.min_loss_weight,
                     options.max_loss_weight,
                 )
 
-            batch_total_loss = torch.dot(loss_weights, component_losses)    # 加权损失
+            batch_total_loss = torch.dot(loss_weights, objective_losses)    # 归一化后的加权损失
             batch_total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), options.grad_clip)   # 梯度裁剪
             optimizer.step()
 
             # 记录批次损失项和总损失
             scenario_loss_terms.extend([terms.detach() for terms in batch_component_losses])
-            weighted_loss_terms.extend([(loss_weights.detach() * terms.detach()) for terms in batch_component_losses])
+            weighted_loss_terms.extend([
+                loss_weights.detach() * (
+                    terms.detach()
+                    if epoch_loss_scales is None
+                    else terms.detach() / epoch_loss_scales
+                )
+                for terms in batch_component_losses
+            ])
             batch_total_losses.append(batch_total_loss.detach())    # 加权损失
 
             batch_count += 1
 
-        mean = (torch.stack(scenario_loss_terms).mean(0).cpu().numpy())   # 计算每个损失项的平均值
+        mean_tensor = torch.stack(scenario_loss_terms).mean(0)
+        if loss_scales is None and options.auto_initialize_weights:
+            loss_scales = mean_tensor.detach().clamp_min(1.0e-12)
+        mean = mean_tensor.cpu().numpy()   # 计算每个损失项的平均值
         weighted_mean = (torch.stack(weighted_loss_terms).mean(0).cpu().numpy())   # 计算每个加权损失项的平均值
         total_mean = torch.stack(batch_total_losses).mean().item()
 
         # 评估模型在测试集和训练集上的表现
-        test = evaluate(model, dataset, condition_standardizer, dataset.test_files)
-        train_eval = evaluate(model, dataset, condition_standardizer, dataset.train_files)
+        test = evaluate(model, dataset, condition_standardizer, dataset.test_files, seed=2033)
+        train_eval = evaluate(model, dataset, condition_standardizer, dataset.train_files, seed=2034)
 
         # 保存最佳模型
         if test and test["q_nse"] > best_q_nse:
@@ -429,8 +460,13 @@ def train(model, pde, dataset, condition_standardizer, options, output_directory
         labels = ("IC", "BC", "Data", "Mass", "Mom")
         header = "           " + "".join(f"{label:>14}" for label in labels)
         raw_text = "raw      " + "".join(f"{value:14.2e}" for value in mean)
+        effective_loss_weights = (
+            loss_weights.detach()
+            if epoch_loss_scales is None
+            else loss_weights.detach() / epoch_loss_scales
+        )
         weight_text = "weight   " + "".join(
-            f"{value:14.2e}" for value in loss_weights.detach().cpu().tolist()
+            f"{value:14.2e}" for value in effective_loss_weights.cpu().tolist()
         )
         weighted_text = "weighted " + "".join(f"{value:14.2e}" for value in weighted_mean)
         print(
@@ -447,7 +483,7 @@ def train(model, pde, dataset, condition_standardizer, options, output_directory
         writer.writerow(
             (
                 epoch, total_mean, *mean, *weighted_mean,
-                *loss_weights.detach().cpu().tolist(),
+                *effective_loss_weights.cpu().tolist(),
                 "" if test is None else test["q_nse"],
             )
         )
