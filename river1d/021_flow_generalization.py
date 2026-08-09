@@ -48,7 +48,9 @@ class TrainingOptions:
     momentum_weight: float = 1.0
     # 适应性权重更新
     adaptive_weighting: bool = True
-    weight_update_start: int = 10
+    # 先使用固定权重训练若干 epoch，再开启自适应更新
+    fixed_weight_epochs: int = 30
+    weight_update_start: int = 30
     weight_update_every: int = 30
     weight_update_rate: float = 0.2
     min_loss_weight: float = 0.01
@@ -342,6 +344,11 @@ def train(model, pde, dataset, condition_standardizer, options, output_directory
         dtype=torch.float32,
         device=compute_device,
     )
+    # 固定阶段使用配置中的权重；先限制在允许范围内并归一化，
+    # 保证初始总权重为损失项数量，避免某一项因配置失误直接支配训练。
+    with torch.no_grad():
+        loss_weights.clamp_(min=options.min_loss_weight, max=options.max_loss_weight)
+        loss_weights.mul_(loss_weights.numel() / loss_weights.sum().clamp_min(1.0e-12))
 
     history = (output_directory / "history.csv").open("w", newline="", encoding="utf-8")
     writer = csv.writer(history)
@@ -381,6 +388,7 @@ def train(model, pde, dataset, condition_standardizer, options, output_directory
 
             if (
                 options.adaptive_weighting
+                and epoch > options.fixed_weight_epochs
                 and epoch >= options.weight_update_start
                 and epoch % options.weight_update_every == 0
                 and start == 0
