@@ -1,1010 +1,481 @@
+"""501 个 HEC-RAS 流量过程的条件算子 PINN
+
+主流程只有：读取数据 -> 条件编码 -> 网络/PDE -> 训练评估
+"""
+
 import csv
 import json
-from collections import OrderedDict
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import torch
 from torch import nn
 
 try:
     from config import CONFIG
-except ImportError:
-    from .config import CONFIG
-
-try:
     from _geometry import CrossSectionGeometry
 except ImportError:
+    from .config import CONFIG
     from ._geometry import CrossSectionGeometry
 
-# ============================ 配置 ============================
-REPO_ROOT = Path(__file__).resolve().parent.parent
-DATASET_DIR = REPO_ROOT / "training_dataset"
-CACHE_DIR = REPO_ROOT / "training_dataset_cache"
-CROSS_SECTION_PATH = CONFIG.cross_section_path
-MANNING_N = 0.016
-SEED = 2032
-READ_GEOMETRY_GRIDS = False
-CONDITION_TIME_POINTS = 32
-CONDITION_SPACE_POINTS = 16
-CONDITION_DIM = 2 * CONDITION_TIME_POINTS + 2 * CONDITION_SPACE_POINTS
-CODE_DIM = 32
-HIDDEN_DIM = 64
+
+# ============================== 配置 ==============================
+project_root = Path(__file__).resolve().parent.parent
+cache_directory = project_root / "training_dataset_cache"
+cross_section_profile_path = CONFIG.cross_section_path
+manning_roughness = 0.016
+condition_time_points = 32
+condition_space_points = 16
+condition_input_dim = 2 * (condition_time_points + condition_space_points)
 
 
 @dataclass
-class TrainOptions:
-    """训练参数；修改实验时优先只改这里。"""
-
-    # 训练过程
-    epochs: int = 200
-    physics_batch_size: int = 256
-    scenarios_per_batch: int = 8
-    eval_every: int = 500
-    save_every: int = 500
-
-    # 损失权重
+class TrainingOptions:
+    epochs: int = 300
+    scenarios_per_batch: int = 4
+    physics_points: int = 512
+    learning_rate: float = 3.0e-4
+    grad_clip: float = 1.0
+    # 监督点断面索引
+    supervised_section_indices: tuple = (23, 46, 69)
+    # 初始权重
     initial_weight: float = 1.0
     boundary_weight: float = 1.0
     data_weight: float = 1.0
-    physics_weight: float = 1.0e-3
-    physics_warmup_epochs: int = 1000
+    physics_weight: float = 1.0
     mass_weight: float = 1.0
     momentum_weight: float = 1.0
+    # 适应性权重更新
+    adaptive_weighting: bool = True
+    weight_update_start: int = 10
+    weight_update_every: int = 30
+    weight_update_rate: float = 0.2
+    min_loss_weight: float = 0.01
+    max_loss_weight: float = 100.0
 
-    # 优化器
-    grad_clip: float = 1.0
-    learning_rate: float = 1.0e-3
+def to_tensor(value):
+    """将输入数据转换为当前计算设备上的单精度张量"""
+    return torch.as_tensor(value, dtype=torch.float32, device=compute_device)
 
-    # 内部断面监督
-    data_section_indices: object = None
+def select_device():
+    """选择可用的计算设备；当前 MPS 因几何插值兼容性问题回退到 CPU"""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
 
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        print("检测到 MPS，但当前 PDE 几何插值存在兼容性问题，回退 CPU")
+        return torch.device("cpu")
 
-# ============================ 基础工具 ============================
-def grad(outputs, inputs):
-    return torch.autograd.grad(
-        outputs,
-        inputs,
-        grad_outputs=torch.ones_like(outputs),
-        create_graph=True,
-        retain_graph=True,
-    )[0]
+    return torch.device("cpu")
 
+compute_device = select_device()
 
-def fit_normalizer_and_scales(
-    dataset,
-    files,
-    time_points=CONDITION_TIME_POINTS,
-    space_points=CONDITION_SPACE_POINTS,
-):
-    """
-    一次扫描训练文件，同时完成：
-    1. condition mean/std
-    2. Z/Q 输出 mean/std
-    这样避免 ConditionNormalizer 和 DataScales 各自再扫一遍全部 CSV。
-    """
-    first = dataset.load(files[0])
-    condition_values = []
-    z_sum = 0.0
-    z_square_sum = 0.0
-    z_count = 0
-    q_sum = 0.0
-    q_square_sum = 0.0
-    q_count = 0
-    for path in files:
-        scenario = dataset.load(path)
-        condition_values.append(
-            dataset.condition_vector(path, time_points=time_points, space_points=space_points)
-        )
-        z = scenario.z_grid.astype(np.float64, copy=False)
-        q = scenario.q_grid.astype(np.float64, copy=False)
-        z_sum += z.sum()
-        z_square_sum += np.square(z).sum()
-        z_count += z.size
-        q_sum += q.sum()
-        q_square_sum += np.square(q).sum()
-        q_count += q.size
-    condition_values = np.stack(condition_values, axis=0)
-    condition_mean = condition_values.mean(axis=0).astype(np.float32)
-    condition_std = condition_values.std(axis=0).astype(np.float32)
-    # condition_std = np.maximum(condition_std, 1.0e-6)
-    scales = DataScales.from_statistics(
-        first, z_sum, z_square_sum, z_count,
-        q_sum, q_square_sum, q_count,
-    )
-    normalizer = ConditionNormalizer(condition_mean, condition_std)
-    return normalizer, scales
-
-
-def to_tensor(array):
-    return torch.as_tensor(array, dtype=torch.float32)
-
-
-# ============================ 数据读取与条件编码 ============================
-def read_one_scenario(path, warmup_days=3.0):
-    """文件读取与整理，其中 warmup 取为模型热启动/调整期"""
-    cache_path = CACHE_DIR / f"{Path(path).stem}_warmup{warmup_days:g}.npz"
-    if cache_path.exists():
-        cached = np.load(cache_path)
-        return (
-            cached["times"], cached["stations"], cached["z_grid"], cached["q_grid"],
-            None, None, None,
-        )
-    usecols = ["time_days", "river_station", "water_surface_m", "flow_m3s"]
-    dtype = {
-        "time_days": "float32",
-        "river_station": "float32",
-        "water_surface_m": "float32",
-        "flow_m3s": "float32",
-    }
-    if READ_GEOMETRY_GRIDS:
-        usecols += [
-            "velocity_total_ms",
-            "area_flow_total_m2",
-            "top_width_total_m",
-        ]
-        dtype.update({
-            "velocity_total_ms": "float32",
-            "area_flow_total_m2": "float32",
-            "top_width_total_m": "float32",
-        })
-    frame = pd.read_csv(path, usecols=usecols, dtype=dtype)
-    frame = frame[frame["time_days"] >= warmup_days].copy()
-    frame["time_days"] = frame["time_days"] - warmup_days
-    times = np.sort(frame["time_days"].unique())
-    stations = np.sort(frame["river_station"].unique())[::-1]
-    def pivot(column):
-        table = (
-            frame.pivot(
-                index="time_days",
-                columns="river_station",
-                values=column,
-            ).reindex(index=times, columns=stations)
-        )
-        return table.to_numpy(dtype=np.float32)
-    z_grid = pivot("water_surface_m")       # 水位
-    q_grid = pivot("flow_m3s")              # 流量
-    if READ_GEOMETRY_GRIDS:
-        u_grid = pivot("velocity_total_ms")     # 流速
-        area_grid = pivot("area_flow_total_m2") # 过流面积
-        width_grid = pivot("top_width_total_m") # 河宽
-    else:
-        u_grid = None
-        area_grid = None
-        width_grid = None
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    np.savez(
-        cache_path,
-        times=times.astype(np.float32),
-        stations=stations.astype(np.float32),
-        z_grid=z_grid,
-        q_grid=q_grid,
-    )
-    return times, stations, z_grid, q_grid, u_grid, area_grid, width_grid
-
-class ScenarioData:
-    def __init__(self, path, warmup_days=3.0):
-        self.path = path
-        self.name = path.name.split("_", 1)[0]
-        (
-            times, stations, z_grid, q_grid, 
-            u_grid, area_grid, width_grid, 
-        ) = read_one_scenario(path, warmup_days=warmup_days)
-        t_s = (times * 24.0 * 3600.0).astype(np.float32)
-        x_m = ((stations[0] - stations) * 1000.0).astype(np.float32)
-        self.times = times
-        self.stations = stations
-        self.x_m = x_m
-        self.t_s = t_s
-        self.z_grid = z_grid
-        self.q_grid = q_grid
-        self.area_grid = area_grid
-        self.width_grid = width_grid
-        self.u_grid = u_grid
-        if area_grid is None or width_grid is None:
-            self.h_grid = None
-        else:
-            self.h_grid = area_grid / np.maximum(width_grid, 1.0e-6)
-        self.nt = len(t_s)
-        self.nx = len(x_m)
-        self.duration_s = t_s[-1] - t_s[0]
-        self.length_m = x_m[-1] - x_m[0]
-        self.supervised_cache = {}
-
+# ============================== 数据 ==============================
 class ScenarioDataset:
-    def __init__(self, dataset_dir, warmup_days=3.0, test_every=10, cache_size=64):
-        self.dataset_dir = Path(dataset_dir)
-        self.warmup_days = warmup_days
-        self.test_every = test_every
-        self.cache_size = cache_size
-        self.cache = OrderedDict()
+    """场景文件列表、训练/测试划分和内存缓存"""
+
+    def __init__(self, cache_directory, test_every=10, cache_limit=16):
+        """初始化场景文件列表、训练测试划分及场景缓存"""
+        self.cache_limit = cache_limit
+        self.scenario_files = sorted(Path(cache_directory).glob("S*_hydrodynamics_all_sections_15min_warmup3.npz"))
+        self.train_files = [path for i, path in enumerate(self.scenario_files, 1) if i % test_every]
+        self.test_files = [path for i, path in enumerate(self.scenario_files, 1) if not i % test_every]
+        self.scenario_cache = {}
         self.condition_cache = {}
-        self.files = sorted(
-            self.dataset_dir.glob("S*_hydrodynamics_all_sections_15min.csv")
-        )
-        self.names = [path.name.split("_", 1)[0] for path in self.files]
-        self.name_to_path = {
-            path.name.split("_", 1)[0]: path for path in self.files
-        }
-        self.train_files = []
-        self.test_files = []
-        for i, path in enumerate(self.files, start=1):
-            if i % self.test_every == 0:
-                self.test_files.append(path)
-            else:
-                self.train_files.append(path)
 
-    def load(self, path):
-        path = Path(path)
-        key = path.name
-        if key in self.cache:
-            scenario = self.cache.pop(key)
-            self.cache[key] = scenario
-            return scenario
-        scenario = ScenarioData(path, warmup_days=self.warmup_days)
-        self.cache[key] = scenario
-        while len(self.cache) > self.cache_size:
-            self.cache.popitem(last=False)
-        return scenario
+    def load_scenario(self, scenario_path):
+        """加载指定场景，并在缓存容量超限时移除最早缓存项"""
+        scenario_path = Path(scenario_path)
+        if scenario_path not in self.scenario_cache:
+            raw = np.load(scenario_path)
+            stations = raw["stations"]
+            self.scenario_cache[scenario_path] = {
+                "t": raw["times"] * 24.0 * 3600.0,
+                "x": (stations[0] - stations) * 1000.0,
+                "z": raw["z_grid"],
+                "q": raw["q_grid"],
+            }
+            if len(self.scenario_cache) > self.cache_limit:
+                self.scenario_cache.pop(next(iter(self.scenario_cache)))
 
-    def load_by_name(self, name):
-        if name not in self.name_to_path:
-            raise ValueError(f"没有找到 scenario: {name}")
-        return self.load(self.name_to_path[name])
+        return self.scenario_cache[scenario_path]
 
-    def condition_vector(
-        self,
-        path,
-        time_points=CONDITION_TIME_POINTS,
-        space_points=CONDITION_SPACE_POINTS,
-    ):
-        key = (Path(path).name, time_points, space_points)
-        if key not in self.condition_cache:
-            scenario = self.load(path)
-            self.condition_cache[key] = scenario_condition_vector(
-                scenario, time_points=time_points, space_points=space_points
-            )
-        return self.condition_cache[key]
-
-def scenario_condition_vector(
-    scenario,
-    time_points=CONDITION_TIME_POINTS,
-    space_points=CONDITION_SPACE_POINTS,
-):
-    """
-    构造一个 scenario 的算子条件编码输入。
-    不使用人工统计特征，只使用原始函数的固定采样点。
-    """
-    q_up = scenario.q_grid[:, 0]    # 上游流量边界过程
-    z_down = scenario.z_grid[:, -1] # 下游水位边界过程
-    z0 = scenario.z_grid[0, :]  # 初始水位场
-    q0 = scenario.q_grid[0, :]  # 初始流量场
-    time_index = np.linspace(0, len(q_up) - 1, time_points).round().astype(int)
-    space_index = np.linspace(0, len(z0) - 1, space_points).round().astype(int)
-    q_up_sample = q_up[time_index]
-    z_down_sample = z_down[time_index]
-    z0_sample = z0[space_index]
-    q0_sample = q0[space_index]
-    condition = np.concatenate([
-        q_up_sample,
-        z_down_sample,
-        z0_sample,
-        q0_sample,
-    ])
-    return condition
-
-class ConditionNormalizer:
-    def __init__(self, mean, std):
-        self.mean = mean
-        self.std = std
-    def transform(self, condition):
-        return (condition - self.mean) / self.std
+    def get_condition_vector(self, scenario_path):
+        """提取指定场景的边界和初始条件并组成条件向量："""
+        scenario_path = Path(scenario_path)
+        if scenario_path not in self.condition_cache:
+            scenario = self.load_scenario(scenario_path)
+            time_indices = np.linspace(0, len(scenario["t"]) - 1, condition_time_points).round().astype(int)
+            space_indices = np.linspace(0, len(scenario["x"]) - 1, condition_space_points).round().astype(int)
+            # 上游边界流量过程、下游边界水位条件、初始时刻的水位空间分布、初始时刻的流量空间分布
+            self.condition_cache[scenario_path] = np.concatenate((
+                scenario["q"][:, 0][time_indices], scenario["z"][:, -1][time_indices],
+                scenario["z"][0, :][space_indices], scenario["q"][0, :][space_indices],
+            )).astype("float32")
+        return self.condition_cache[scenario_path]
 
 
-# ============================ 算子网络 ============================
+class ConditionStandardizer:
+    def __init__(self, condition_vectors):
+        """根据《条件样本》计算逐维标准化所需的均值和标准差"""
+        self.mean = condition_vectors.mean(axis=0).astype("float32")
+        self.std = np.maximum(condition_vectors.std(axis=0), 1.0e-6).astype("float32")
+
+    def transform(self, condition_vector):
+        """使用已计算的统计量标准化一个条件向量"""
+        return (condition_vector - self.mean) / self.std
+
+# ============================== 物理尺度 ==============================
+class PhysicalScales:
+    def __init__(self, reference_scenario, water_level_values, discharge_values):
+        """根据参考场景及样本数据初始化空间、时间和物理量尺度"""
+        self.x_min, self.x_max = float(reference_scenario["x"][0]), float(reference_scenario["x"][-1])
+        self.t_min, self.t_max = float(reference_scenario["t"][0]), float(reference_scenario["t"][-1])
+        self.length = self.x_max - self.x_min
+        self.z_mean, self.z_std = float(water_level_values.mean()), float(water_level_values.std())
+        self.q_mean, self.q_std = float(discharge_values.mean()), float(discharge_values.std())
+
+    def x_normalize(self, x):
+        """将空间坐标线性归一化到 [-1, 1]"""
+        return 2.0 * (x - self.x_min) / self.length - 1.0
+
+    def t_normalize(self, t):
+        """将时间坐标线性归一化到 [-1, 1]"""
+        return 2.0 * (t - self.t_min) / (self.t_max - self.t_min) - 1.0
+
+    def q_denormalize(self, q):
+        """将标准化流量还原为物理单位下的流量"""
+        return q * self.q_std + self.q_mean
+
+def fit_condition_normalizer_and_scales(dataset):
+    """根据训练集计算：条件向量的均值和标准差，以及水位和流量的物理尺度"""
+    condition_vectors, water_level_values, discharge_values = [], [], []
+    for scenario_path in dataset.train_files:
+        scenario = dataset.load_scenario(scenario_path)
+        condition_vectors.append(dataset.get_condition_vector(scenario_path))   # 所有条件向量
+        water_level_values.append(scenario["z"].reshape(-1))    # 所有水位
+        discharge_values.append(scenario["q"].reshape(-1))      # 所有流量
+    reference_scenario = dataset.load_scenario(dataset.train_files[0])
+
+    return ConditionStandardizer(np.stack(condition_vectors)), PhysicalScales(
+        reference_scenario,
+        np.concatenate(water_level_values),
+        np.concatenate(discharge_values),
+    )
+
+
+# ============================== 网络架构 ==============================
 class OperatorPINN(nn.Module):
-    def __init__(
-        self,
-        condition_dim,
-        scales, 
-        code_dim=CODE_DIM,
-        hidden_dim=HIDDEN_DIM,
-        output_dim=2,
-        geometry=None,
-        depth_floor=0.05,
-        depth_scale=5.0,
-    ):
+    def __init__(self, scales, geometry, code_dim=32, hidden=64):
+        """初始化条件分支、时空分支及水位流量预测头"""
         super().__init__()
-        self.scales = scales
-        self.geometry = geometry
-        self.depth_floor = depth_floor  # 最小水深，防止水深为 0
-        self.depth_scale = depth_scale  # 控制网络输出水深的变化范围
+        self.scales, self.geometry = scales, geometry
         self.branch = nn.Sequential(
-            nn.Linear(condition_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, code_dim),
+            nn.Linear(condition_input_dim, hidden), nn.GELU(),
+            nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, code_dim)
         )
         self.trunk = nn.Sequential(
-            nn.Linear(2, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, code_dim),
+            nn.Linear(2, hidden), nn.GELU(),
+            nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, code_dim)
         )
         self.head = nn.Sequential(
-            nn.Linear(code_dim * 2, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, output_dim),
+            nn.Linear(2 * code_dim, hidden), nn.GELU(),
+            nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, 2)
         )
 
     def forward(self, x, t, condition):
-        """
-        x: [n]
-        t: [n]
-        condition: [condition_dim] 或 [n, condition_dim]
-        """
-        if condition.dim() == 1:
-            condition = condition.unsqueeze(0).expand(x.shape[0], -1)
-        x_hat = self.scales.normalize_x(x)
-        t_hat = self.scales.normalize_t(t)
-        xt = torch.stack([x_hat, t_hat], dim=1)
-        branch_code = self.branch(condition)
-        trunk_code = self.trunk(xt)
-        features = torch.cat([trunk_code, branch_code], dim=1)
-        output = self.head(features)
-        z_raw = output[:, 0]
-        q_hat = output[:, 1]
-        if self.geometry is None:
-            raise RuntimeError("OperatorPINN 需要断面 geometry 才能计算有效水位")
-        bed_level, _ = self.geometry.stage_bounds(x)
-        # 以米为单位生成正水深；不再用全局水位均值初始化，避免局部断面干涸。
-        depth = self.depth_floor + self.depth_scale * torch.nn.functional.softplus(z_raw)
-        z = bed_level + depth
-        q = self.scales.denormalize_q(q_hat)
-        return z, q
+        """根据时空坐标和场景条件预测水位与流量"""
+        if condition.ndim == 1:
+            condition = condition.expand(x.numel(), -1)
+        xt = torch.stack((self.scales.x_normalize(x), self.scales.t_normalize(t)), 1)
+        code = torch.cat((self.trunk(xt), self.branch(condition)), 1)
+        raw = self.head(code)
+        bed, _ = self.geometry.stage_bounds(x)
+        depth = 0.0005 + 5.0 * torch.nn.functional.softplus(raw[:, 0])
+        return bed + depth, self.scales.q_denormalize(raw[:, 1])
 
-# ============================ 物理量尺度 ============================
-class DataScales:
-    @classmethod
-    def from_statistics(
-        cls,
-        scenario,
-        z_sum,
-        z_square_sum,
-        z_count,
-        q_sum,
-        q_square_sum,
-        q_count,
-    ):
-        obj = cls.__new__(cls)
-        obj.x_min = scenario.x_m[0]
-        obj.x_max = scenario.x_m[-1]
-        obj.t_min = scenario.t_s[0]
-        obj.t_max = scenario.t_s[-1]
-        obj.z_mean = z_sum / z_count
-        z_var = z_square_sum / z_count - obj.z_mean ** 2
-        obj.z_std = max(float(np.sqrt(max(z_var, 1.0e-12))), 1.0e-6)
-        obj.q_mean = q_sum / q_count
-        q_var = q_square_sum / q_count - obj.q_mean ** 2
-        obj.q_std = max(float(np.sqrt(max(q_var, 1.0e-12))), 1.0e-6)
-        obj.length_m = float(scenario.length_m)
-        obj.depth_m = float(obj.z_std)
-        obj.discharge_m3_s = float(max(abs(obj.q_mean), obj.q_std, 1.0e-6))
-        return obj
-    def normalize_x(self, x):
-        return 2.0 * (x - self.x_min) / (self.x_max - self.x_min) - 1.0
-    def normalize_t(self, t):
-        return 2.0 * (t - self.t_min) / (self.t_max - self.t_min) - 1.0
-    def denormalize_z(self, z_hat):
-        return z_hat * self.z_std + self.z_mean
-    def denormalize_q(self, q_hat):
-        return q_hat * self.q_std + self.q_mean
 
-def scales_to_dict(scales):
-    return {
-        "x_min": float(scales.x_min),
-        "x_max": float(scales.x_max),
-        "t_min": float(scales.t_min),
-        "t_max": float(scales.t_max),
-        "z_mean": float(scales.z_mean),
-        "z_std": float(scales.z_std),
-        "q_mean": float(scales.q_mean),
-        "q_std": float(scales.q_std),
-        "length_m": float(scales.length_m),
-        "depth_m": float(scales.depth_m),
-        "discharge_m3_s": float(scales.discharge_m3_s),
-    }
+# ============================== PDE ==============================
+def derivative(output, variable):
+    """计算输出相对于输入变量的一阶自动微分导数"""
+    return torch.autograd.grad(
+        output, variable, torch.ones_like(output), create_graph=True, retain_graph=True
+    )[0]
 
-# ============================ 监督数据与 PDE ============================
-def save_checkpoint(
-    path,
-    model,
-    optimizer,
-    epoch,
-    best_metric,
-    normalizer,
-    scales,
-    train_options,
-):
-    torch.save(
-        {
-            "epoch": epoch,
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "best_test_q_nse": best_metric,
-            "condition_mean": normalizer.mean,
-            "condition_std": normalizer.std,
-            "scales": scales_to_dict(scales),
-            "train_options": train_options,
-        },
-        path,
-    )
 
-def supervised_data(scenario, kind, section_indices=None):
-    """返回初始、边界或内部断面监督数据。"""
-    if kind == "initial":
-        key = "initial"
-        if key not in scenario.supervised_cache:
-            scenario.supervised_cache[key] = (
-                scenario.x_m,
-                np.zeros_like(scenario.x_m),
-                scenario.z_grid[0],
-                scenario.q_grid[0],
-            )
-        return scenario.supervised_cache[key]
-    if kind == "boundary":
-        key = "boundary"
-        if key not in scenario.supervised_cache:
-            t = scenario.t_s
-            scenario.supervised_cache[key] = (
-                np.concatenate([np.full_like(t, scenario.x_m[0]), np.full_like(t, scenario.x_m[-1])]),
-                np.tile(t, 2),
-                np.concatenate([scenario.z_grid[:, 0], scenario.z_grid[:, -1]]),
-                np.concatenate([scenario.q_grid[:, 0], scenario.q_grid[:, -1]]),
-            )
-        return scenario.supervised_cache[key]
-    if section_indices is None:
-        fractions = np.linspace(0.25, 0.75, 3)
-        section_indices = np.round(fractions * (scenario.nx - 1)).astype(int)
-    section_indices = np.asarray(section_indices, dtype=int)
-    if np.any(section_indices <= 0) or np.any(section_indices >= scenario.nx - 1):
-        raise ValueError("内部监督断面不能包含上游/下游边界断面")
-    key = ("sections", tuple(section_indices.tolist()))
-    if key not in scenario.supervised_cache:
-        x_grid, t_grid = np.meshgrid(
-            scenario.x_m[section_indices], scenario.t_s, indexing="xy"
-        )
-        scenario.supervised_cache[key] = (
-            x_grid.reshape(-1), t_grid.reshape(-1),
-            scenario.z_grid[:, section_indices].reshape(-1),
-            scenario.q_grid[:, section_indices].reshape(-1),
-        )
-    return scenario.supervised_cache[key]
-
-def supervised_loss(model, scales, condition, batch):
-    """计算一组监督点的 Z/Q 无量纲 MSE。"""
-    x_np, t_np, z_np, q_np = batch
-    z_pred, q_pred = model(to_tensor(x_np), to_tensor(t_np), condition)
-    z_true = to_tensor(z_np)
-    q_true = to_tensor(q_np)
-    z_loss = ((z_pred - z_true)).square().mean()
-    q_loss = ((q_pred - q_true)).square().mean()
-    return z_loss + q_loss, z_loss, q_loss
-
-def sample_physics_batch(scenario, batch_size):
-    x = scenario.x_m[0] + (scenario.x_m[-1] - scenario.x_m[0]) * np.random.rand(
-        batch_size
-    ).astype(np.float32)
-    t = scenario.t_s[0] + (scenario.t_s[-1] - scenario.t_s[0]) * np.random.rand(
-        batch_size
-    ).astype(np.float32)
-    return x, t
-
-class OperatorPDEResidual(nn.Module):
-    """
-    对条件算子网络计算 1D Saint-Venant PDE residual。
-    输入仍是 x,t,condition。
-    输出是无量纲 mass/momentum loss。
-    """
-    def __init__(
-        self,
-        geometry,
-        scales,
-        manning_n=MANNING_N,
-        gravity=9.81,
-        epsilon=1.0e-6,
-    ):
-        super().__init__()
+class PDE:
+    def __init__(self, geometry, manning_n=manning_roughness, gravity=9.81):
+        """初始化基于断面几何的浅水方程物理参数"""
         self.geometry = geometry
-        self.scales = scales
-        self.manning_n = manning_n
-        self.gravity = gravity
-        self.epsilon = epsilon
-        (
-            self.area_m2,
-            self.velocity_m_s,
-            self.friction_slope,
-            self.momentum_scale,
-        ) = self._estimate_physics_scales()
-    def _estimate_physics_scales(self):
-        x = torch.linspace(
-            float(self.scales.x_min),
-            float(self.scales.x_max),
-            steps=256,
-            dtype=torch.float32,
-        )
-        z = torch.full_like(x, float(self.scales.z_mean))
-        area, _, perimeter = self.geometry(x, z, None)
-        area0 = float(area.mean().clamp_min(self.epsilon))
-        radius0 = float((area / perimeter.clamp_min(self.epsilon)).mean().clamp_min(self.epsilon))
-        q0 = float(self.scales.discharge_m3_s)
-        velocity0 = q0 / max(area0, self.epsilon)
-        friction_slope = (
-            self.manning_n**2
-            * q0**2
-            / (area0**2 * radius0 ** (4.0 / 3.0))
-        )
-        inertial_scale = q0 * abs(velocity0) / max(self.scales.length_m, self.epsilon)
-        pressure_scale = (
-            self.gravity
-            * area0
-            * max(float(self.scales.depth_m), self.epsilon)
-            / max(self.scales.length_m, self.epsilon)
-        )
-        friction_scale = self.gravity * area0 * max(float(friction_slope), self.epsilon)
-        momentum_scale = max(inertial_scale, pressure_scale, friction_scale, self.epsilon)
-        return area0, abs(float(velocity0)), max(float(friction_slope), self.epsilon), momentum_scale
-
-    def residual(self, model, x, t, condition):
-        x = x.detach().clone().requires_grad_(True)
-        t = t.detach().clone().requires_grad_(True)
-        water_level, discharge = model(x, t, condition)
-        area, _, perimeter = self.geometry(x, water_level, t)
-        area_t = grad(area, t)
-        discharge_t = grad(discharge, t)
-        discharge_x = grad(discharge, x)
-        flux_adv_x = grad(discharge.square() / area.clamp_min(self.epsilon), x)
-        water_level_x = grad(water_level, x)
-        radius = area / perimeter.clamp_min(self.epsilon)
-        friction = (
-            self.manning_n**2
-            * discharge
-            * discharge.abs() / (
-                area.square().clamp_min(self.epsilon)
-                * radius.clamp_min(self.epsilon).pow(4.0 / 3.0)
-            )
-        )
-        mass = area_t + discharge_x
-        momentum = (
-            discharge_t
-            + flux_adv_x
-            + self.gravity * area * water_level_x
-            + self.gravity * area * friction
-        )
-        # mass_scale = self.scales.discharge_m3_s / max(self.scales.length_m, self.epsilon)
-        # momentum_scale = self.momentum_scale
-        # mass = mass / max(mass_scale, self.epsilon)
-        # momentum = momentum / max(momentum_scale, self.epsilon)
-        return mass, momentum
+        self.manning_n, self.gravity = manning_n, gravity
 
     def loss(self, model, x, t, condition):
-        mass, momentum = self.residual(model, x, t, condition)
+        """计算质量守恒和动量守恒方程的均方残差"""
+        x = x.detach().clone().requires_grad_(True)
+        t = t.detach().clone().requires_grad_(True)
+        z, q = model(x, t, condition)
+        area, _, perimeter = self.geometry(x, z)
+        area_t = derivative(area, t)
+        q_t = derivative(q, t)
+        q_x = derivative(q, x)
+        flux_x = derivative(q.square() / area.clamp_min(1.0e-6), x)
+        z_x = derivative(z, x)
+        radius = area / perimeter.clamp_min(1.0e-6)
+        friction = self.manning_n ** 2 * q * q.abs() / (
+            area.square().clamp_min(1.0e-6) * radius.clamp_min(1.0e-6).pow(4.0 / 3.0)
+        )
+        mass = area_t + q_x
+        momentum = q_t + flux_x + self.gravity * area * (z_x + friction)
         return mass.square().mean(), momentum.square().mean()
-    
-# ============================ 评估与训练 ============================
-@torch.no_grad()
-def evaluate(
-    model,
-    dataset,
-    normalizer,
-    files,
-    scenario_count=32,
-    points_per_scenario=4096,
-):
-    """
-    对若干 scenario 随机采样评估。
-    不扫全场，避免评估拖慢训练。
-    """
-    model.eval()
-    if len(files) > scenario_count:
-        selected_files = np.random.choice(files, size=scenario_count, replace=False)
-    else:
-        selected_files = files
-    z_predictions = []
-    q_predictions = []
-    z_targets = []
-    q_targets = []
-    for path in selected_files:
-        scenario = dataset.load(path)
-        condition = dataset.condition_vector(path)
-        condition_norm = normalizer.transform(condition)
-        time_index = np.random.randint(0, scenario.nt, size=points_per_scenario)
-        space_index = np.random.randint(0, scenario.nx, size=points_per_scenario)
-        x_np = scenario.x_m[space_index]
-        t_np = scenario.t_s[time_index]
-        z_np = scenario.z_grid[time_index, space_index]
-        q_np = scenario.q_grid[time_index, space_index]
-        z_pred, q_pred = model(
-            to_tensor(x_np), to_tensor(t_np), to_tensor(condition_norm)
+
+
+# ============================== 训练 ==============================
+def supervised_points(scenario, kind, section_indices=(23, 46, 69)):
+    """返回初始、边界或内部断面监督点"""
+    x, t, z, q = scenario["x"], scenario["t"], scenario["z"], scenario["q"]
+    if kind == "initial":
+        return x, np.full_like(x, t[0]), z[0], q[0]
+    if kind == "boundary":
+        tb = np.concatenate((t, t))
+        xb = np.concatenate((np.full_like(t, x[0]), np.full_like(t, x[-1])))
+        return xb, tb, np.concatenate((z[:, 0], z[:, -1])), np.concatenate((q[:, 0], q[:, -1]))
+    selected_x, selected_t = np.meshgrid(x[list(section_indices)], t, indexing="xy")
+    return selected_x.ravel(), selected_t.ravel(), z[:, list(section_indices)].ravel(), q[:, list(section_indices)].ravel()
+
+
+def loss_for_scenario(model, pde, scenario, condition, options):
+    """计算单个场景的初始、边界、数据及物理约束损失"""
+    losses = []
+    for kind in ("initial", "boundary", "sections"):
+        x, t, z, q = supervised_points(scenario, kind, options.supervised_section_indices)
+        zp, qp = model(to_tensor(x), to_tensor(t), condition)
+        losses.append(
+            ((zp - to_tensor(z)) ** 2).mean() + ((qp - to_tensor(q)) ** 2).mean()
         )
-        z_predictions.append(z_pred.cpu().numpy())
-        q_predictions.append(q_pred.cpu().numpy())
-        z_targets.append(z_np)
-        q_targets.append(q_np)
-    z_pred = np.concatenate(z_predictions)
-    q_pred = np.concatenate(q_predictions)
-    z_true = np.concatenate(z_targets)
-    q_true = np.concatenate(q_targets)
-    z_den = max(np.linalg.norm(z_true), 1.0e-12)
-    q_den = max(np.linalg.norm(q_true), 1.0e-12)
-    z_var = np.sum((z_true - z_true.mean()) ** 2)
-    q_var = np.sum((q_true - q_true.mean()) ** 2)
-    return {
-        "z_l2": 100.0 * np.linalg.norm(z_pred - z_true) / z_den,
-        "q_l2": 100.0 * np.linalg.norm(q_pred - q_true) / q_den,
-        "z_nse": np.nan if z_var < 1.0e-12 else 1.0 - np.sum((z_pred - z_true) ** 2) / z_var,
-        "q_nse": np.nan if q_var < 1.0e-12 else 1.0 - np.sum((q_pred - q_true) ** 2) / q_var,
-        "scenario_count": len(selected_files),
-    }
+        
+    initial_loss, boundary_loss, data_loss = losses
 
-# 计算单个流量场景的损失
-def scenario_loss(
-        model,
-        pde_residual,
-        scenario,
-        condition,
-        scales,
-        options,
-        epoch,
-    ):
-    """计算一个流量场景的 IC、BC、内部数据和 PDE 损失。"""
-    # 初始损失
-    initial_loss, initial_z_loss, initial_q_loss = supervised_loss(
-        model, scales, condition, supervised_data(scenario, "initial")
-    )
-    # 边界损失
-    boundary_loss, boundary_z_loss, boundary_q_loss = supervised_loss(
-        model, scales, condition, supervised_data(scenario, "boundary")
-    )
-    # 内部数据损失
-    section_data = supervised_data(
-        scenario, "sections", section_indices=options.data_section_indices
-    )
-    data_loss, data_z_loss, data_q_loss = supervised_loss(
-        model, scales, condition, section_data
-    )
-    # PDE 物理损失
-    x_phys_np, t_phys_np = sample_physics_batch(
-        scenario,
-        batch_size=options.physics_batch_size,
-    )
-    mass_loss, momentum_loss = pde_residual.loss(
-        model, to_tensor(x_phys_np), to_tensor(t_phys_np), condition
-    )
-    physics_loss = (
-        options.mass_weight * torch.log1p(mass_loss)
-        + options.momentum_weight * torch.log1p(momentum_loss)
-    )
+    # 随机采样时空点，计算质量守恒和动量守恒损失
+    x = scenario["x"][0] + (scenario["x"][-1] - scenario["x"][0]) * np.random.rand(options.physics_points)
+    t = scenario["t"][0] + (scenario["t"][-1] - scenario["t"][0]) * np.random.rand(options.physics_points)
+    mass_loss, momentum_loss = pde.loss(model, to_tensor(x), to_tensor(t), condition)
 
-    physics_factor = 1 # min(1.0, epoch / max(1, options.physics_warmup_epochs))
-    effective_physics_weight = options.physics_weight * physics_factor
+    return torch.stack((initial_loss, boundary_loss, data_loss, mass_loss, momentum_loss))
 
-    total_loss = (
-        options.initial_weight * initial_loss
-        + options.boundary_weight * boundary_loss
-        + options.data_weight * data_loss
-        + effective_physics_weight * physics_loss
-    )
-
-    return total_loss, {
-        "initial": initial_loss,
-        "boundary": boundary_loss,
-        "data": data_loss,
-        "initial_z": initial_z_loss,
-        "initial_q": initial_q_loss,
-        "boundary_z": boundary_z_loss,
-        "boundary_q": boundary_q_loss,
-        "data_z": data_z_loss,
-        "data_q": data_q_loss,
-        "mass": mass_loss,
-        "momentum": momentum_loss,
-        "effective_physics_weight": effective_physics_weight,
-    }
-
-def train_one_epoch(model,pde_residual,dataset,normalizer,scales,optimizer,options,epoch):
-    """遍历全部训练场景一次，并完成本 epoch 的参数更新。"""
-    model.train()
-    names = (
-        "loss", "initial", "boundary", "data", "initial_z", "initial_q",
-        "boundary_z", "boundary_q", "data_z", "data_q", "mass", "momentum",
-    ) 
-    epoch_values = {name: [] for name in names}
-    shuffled_files = np.random.permutation(dataset.train_files) # 
-    batch_count = 0
-    effective_physics_weight = 0.0
-    for start in range(0, len(shuffled_files), options.scenarios_per_batch):
-        selected_files = shuffled_files[start:start + options.scenarios_per_batch]
-        batch_count += 1
-        optimizer.zero_grad()
-        batch_losses = []
-        for path in selected_files:
-            scenario = dataset.load(path)
-            condition = to_tensor(normalizer.transform(dataset.condition_vector(path)))
-
-            # 计算损失
-            total_loss, losses = scenario_loss(model, pde_residual, scenario, condition, scales, options, epoch)
-
-            batch_losses.append(total_loss)
-
-            for name in names[1:]:
-                epoch_values[name].append(losses[name].detach())
-
-            effective_physics_weight = losses["effective_physics_weight"]
-
-        batch_loss = torch.stack(batch_losses).mean()
-        batch_loss.backward()
-        if options.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), options.grad_clip)
-        optimizer.step()
-        epoch_values["loss"].append(batch_loss.detach())
-    return epoch_values, batch_count, effective_physics_weight
-
-def train_operator_pinn(
-        model,
-        pde_residual,
-        dataset,
-        normalizer,
-        scales,
-        output_dir,
-        options=None,
-    ):
-    options = options or TrainOptions()
-    optimizer = torch.optim.Adam(model.parameters(), lr=options.learning_rate)
-    train_files = dataset.train_files
-    output_dir = Path(output_dir)
-    history_path = output_dir / "history.csv"
-    best_metric = -float("inf")
-    best_epoch = 0
-    train_options = {
-        "epochs": options.epochs,
-        "data_section_indices": (
-            None
-            if options.data_section_indices is None
-            else list(options.data_section_indices)
-        ),
-        "physics_batch_size": options.physics_batch_size,
-        "scenarios_per_batch": options.scenarios_per_batch,
-        "batches_per_epoch": int(np.ceil(len(train_files) / options.scenarios_per_batch)),
-        "eval_every": options.eval_every,
-        "save_every": options.save_every,
-        "initial_weight": options.initial_weight,
-        "boundary_weight": options.boundary_weight,
-        "data_weight": options.data_weight,
-        "physics_weight": options.physics_weight,
-        "physics_warmup_epochs": options.physics_warmup_epochs,
-        "mass_weight": options.mass_weight,
-        "momentum_weight": options.momentum_weight,
-        "grad_clip": options.grad_clip,
-        "learning_rate": options.learning_rate,
-    }
-    history_file = history_path.open("w", newline="", encoding="utf-8")
-    fieldnames = [
-        "epoch", "loss", "scenario_count", "batch_count",
-        "initial_loss", "boundary_loss", "data_loss",
-        "initial_z_loss", "initial_q_loss", "boundary_z_loss",
-        "boundary_q_loss", "data_z_loss", "data_q_loss",
-        "mass_loss", "momentum_loss", "effective_physics_weight",
-        "train_z_l2", "train_q_l2", "train_z_nse", "train_q_nse",
-        "test_z_l2", "test_q_l2", "test_z_nse", "test_q_nse",
-        "best_test_q_nse", "best_epoch",
+# 权重
+def update_gradnorm_weights(component_losses, loss_weights, model, learning_rate, min_weight, max_weight):
+    """根据五项损失的梯度范数更新权重"""
+    parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
     ]
+    gradient_norms = []
 
-    writer = csv.DictWriter(history_file, fieldnames=fieldnames)
-    writer.writeheader()
-    for epoch in range(1, options.epochs + 1):
-        epoch_values, batch_count, effective_physics_weight = train_one_epoch(
-            model, pde_residual, dataset, normalizer, scales, optimizer, options, epoch
+    for index in range(component_losses.numel()):
+        gradients = torch.autograd.grad(
+            loss_weights[index] * component_losses[index],
+            parameters,
+            retain_graph=True,
+            allow_unused=True,
         )
-        should_print_loss = epoch == 1 or epoch % 100 == 0
-        should_evaluate = (
-            epoch == 1
-            or epoch % options.eval_every == 0
-            or epoch == options.epochs
+        squared_norm = torch.zeros(
+            (), dtype=component_losses.dtype, device=component_losses.device
         )
-        def mean_epoch_value(name):
-            return torch.stack(epoch_values[name]).mean().item()
-        loss_value = mean_epoch_value("loss")
-        initial_loss_value = mean_epoch_value("initial")
-        boundary_loss_value = mean_epoch_value("boundary")
-        data_loss_value = mean_epoch_value("data")
-        initial_z_loss_value = mean_epoch_value("initial_z")
-        initial_q_loss_value = mean_epoch_value("initial_q")
-        boundary_z_loss_value = mean_epoch_value("boundary_z")
-        boundary_q_loss_value = mean_epoch_value("boundary_q")
-        data_z_loss_value = mean_epoch_value("data_z")
-        data_q_loss_value = mean_epoch_value("data_q")
-        mass_loss_value = mean_epoch_value("mass")
-        momentum_loss_value = mean_epoch_value("momentum")
-        if should_print_loss:
-            print(
-                f"epoch {epoch:4d} | "  # 当前训练轮数
-                f"loss {loss_value:.4e} | " # 当前总损失
-                f"IC {initial_loss_value:.2e} | "   # 初始条件损失
-                f"BC {boundary_loss_value:.2e} | "  # 边界条件损失
-                f"Data {data_loss_value:.2e} | "    # 内部数据损失
-                f"mass {mass_loss_value:.2e} | "    # PDE 质量守恒损失
-                f"mom {momentum_loss_value:.2e} | " # PDE 动量守恒损失
-                f"pw {effective_physics_weight:.1e} | " # 当前有效 PDE 权重
-                f"scenarios {len(train_files)} | "  # 本 epoch 使用的训练场景数量
-                f"batches {batch_count}",   # 本 epoch 分成的批次数
-                flush=True,
-            )
-        train_metrics = None
-        test_metrics = None
-        if should_evaluate:
-            train_metrics = evaluate(
-                model, dataset, normalizer, dataset.train_files,
-                scenario_count=32, points_per_scenario=4096,
-            )
-            test_metrics = evaluate(
-                model, dataset, normalizer, dataset.test_files,
-                scenario_count=len(dataset.test_files),
-                points_per_scenario=4096,
-            )
-            print(
-                f"eval  {epoch:5d} | "
-                f"train L2 Z/Q {train_metrics['z_l2']:5.2f}/"
-                f"{train_metrics['q_l2']:5.2f}% "
-                f"NSE Z/Q {train_metrics['z_nse']:6.3f}/"
-                f"{train_metrics['q_nse']:6.3f} | "
-                f"test L2 Z/Q {test_metrics['z_l2']:5.2f}/"
-                f"{test_metrics['q_l2']:5.2f}% "
-                f"NSE Z/Q {test_metrics['z_nse']:6.3f}/"
-                f"{test_metrics['q_nse']:6.3f}",
-                flush=True,
-            )
-            if test_metrics["q_nse"] > best_metric:
-                best_metric = test_metrics["q_nse"]
-                best_epoch = epoch
-                save_checkpoint(
-                    output_dir / "best.pt", model, optimizer, epoch,
-                    best_metric, normalizer, scales, train_options,
-                )
-        if should_print_loss or should_evaluate:
-            row = {
-                "epoch": epoch,
-                "loss": loss_value,
-                "scenario_count": len(train_files),
-                "batch_count": batch_count,
-                "initial_loss": initial_loss_value,
-                "boundary_loss": boundary_loss_value,
-                "data_loss": data_loss_value,
-                "initial_z_loss": initial_z_loss_value,
-                "initial_q_loss": initial_q_loss_value,
-                "boundary_z_loss": boundary_z_loss_value,
-                "boundary_q_loss": boundary_q_loss_value,
-                "data_z_loss": data_z_loss_value,
-                "data_q_loss": data_q_loss_value,
-                "mass_loss": mass_loss_value,
-                "momentum_loss": momentum_loss_value,
-                "effective_physics_weight": effective_physics_weight,
-                "best_test_q_nse": best_metric,
-                "best_epoch": best_epoch,
-            }
-            if train_metrics is not None and test_metrics is not None:
-                row.update({
-                    "train_z_l2": train_metrics["z_l2"],
-                    "train_q_l2": train_metrics["q_l2"],
-                    "train_z_nse": train_metrics["z_nse"],
-                    "train_q_nse": train_metrics["q_nse"],
-                    "test_z_l2": test_metrics["z_l2"],
-                    "test_q_l2": test_metrics["q_l2"],
-                    "test_z_nse": test_metrics["z_nse"],
-                    "test_q_nse": test_metrics["q_nse"],
-                })
-            writer.writerow(row)
-            history_file.flush()
-        if epoch % options.save_every == 0 or epoch == options.epochs:
-            save_checkpoint(
-                output_dir / "last.pt", model, optimizer, epoch,
-                best_metric, normalizer, scales, train_options,
-            )
-    history_file.close()
-    print(
-        f"finished | best test Q-NSE {best_metric:.4f} @ epoch {best_epoch} | "
-        f"output {output_dir}",
-        flush=True,
-    )
+        for gradient in gradients:
+            if gradient is not None:
+                squared_norm = squared_norm + gradient.square().sum()
+        gradient_norms.append(torch.sqrt(squared_norm + 1.0e-12))
 
-# ============================ 实验入口 ============================
-def main():
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
-    dataset = ScenarioDataset(DATASET_DIR, warmup_days=3.0, test_every=10, cache_size=512)
+    gradient_norms = torch.stack(gradient_norms)
+    target_norm = gradient_norms.mean()
 
-    # 测试
-    # 小批量测试
-    dataset.train_files = dataset.train_files[:8]
-    dataset.test_files = dataset.test_files[:2]
+    with torch.no_grad():
+        ratio = target_norm / gradient_norms.clamp_min(1.0e-12)
+        loss_weights.mul_(ratio.pow(learning_rate))
+        loss_weights.clamp_(min=min_weight, max=max_weight)
+        loss_weights.mul_(loss_weights.numel() / loss_weights.sum().clamp_min(1.0e-12))
+
+    return gradient_norms.detach()
 
 
-    sample_scenario = dataset.load(dataset.train_files[0])
-    # 选择 3 个内部断面作为监督数据
-    data_section_indices = np.round(
-        np.linspace(0.25, 0.75, 3) * (sample_scenario.nx - 1)
-    ).astype(int)
-
-    normalizer, scales = fit_normalizer_and_scales(
-        dataset,
-        dataset.train_files,
-        time_points=CONDITION_TIME_POINTS,
-        space_points=CONDITION_SPACE_POINTS,
-    )
-
-    geometry = CrossSectionGeometry(
-        CROSS_SECTION_PATH, to_tensor(sample_scenario.x_m)
-    )
-
-    model = OperatorPINN(
-        CONDITION_DIM,
-        scales,
-        code_dim=CODE_DIM,
-        hidden_dim=HIDDEN_DIM,
-        geometry=geometry,
-    )
-
-    pde_residual = OperatorPDEResidual(geometry=geometry, scales=scales)
-
-    output_root = REPO_ROOT / "outputs" / "flow_generalization_operator"
-    output_dir = output_root / ("operator_pinn_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
-    output_dir.mkdir(parents=True, exist_ok=False)
-
-    experiment_config = {
-        "seed": SEED,
-        "dataset_dir": str(DATASET_DIR),
-        "cache_dir": str(CACHE_DIR),
-        "cross_section_path": str(CROSS_SECTION_PATH),
-        "warmup_days": dataset.warmup_days,
-        "test_every": dataset.test_every,
-        "scenario_count": len(dataset.files),
-        "train_count": len(dataset.train_files),
-        "test_count": len(dataset.test_files),
-        "condition_dim": CONDITION_DIM,
-        "condition_time_points": CONDITION_TIME_POINTS,
-        "condition_space_points": CONDITION_SPACE_POINTS,
-        "data_section_indices": data_section_indices.tolist(),
-        "data_section_x_m": sample_scenario.x_m[data_section_indices].tolist(),
-        "code_dim": 32,
-        "hidden_dim": 64,
-        "depth_floor": model.depth_floor,
-        "depth_scale": model.depth_scale,
-        "manning_n": MANNING_N,
-        "read_geometry_grids": READ_GEOMETRY_GRIDS,
-        "scales": scales_to_dict(scales),
+@torch.no_grad()
+def evaluate(model, dataset, condition_standardizer, scenario_paths, count=32, points_per_scenario=1024):
+    """在随机采样的场景和时空点上评估水位、流量预测误差及 NSE"""
+    selected_paths = scenario_paths if len(scenario_paths) <= count else np.random.choice(scenario_paths, count, replace=False)
+    predicted_water_levels, predicted_discharges = [], []
+    true_water_levels, true_discharges = [], []
+    for scenario_path in selected_paths:
+        scenario = dataset.load_scenario(scenario_path)
+        point_count = min(points_per_scenario, scenario["x"].size * scenario["t"].size)
+        time_indices = np.random.randint(0, len(scenario["t"]), point_count)
+        space_indices = np.random.randint(0, len(scenario["x"]), point_count)
+        condition = condition_standardizer.transform(dataset.get_condition_vector(scenario_path))
+        predicted_z, predicted_q = model(
+            to_tensor(scenario["x"][space_indices]),
+            to_tensor(scenario["t"][time_indices]),
+            to_tensor(condition),
+        )
+        predicted_water_levels.append(predicted_z.detach().cpu().numpy())
+        predicted_discharges.append(predicted_q.detach().cpu().numpy())
+        true_water_levels.append(scenario["z"][time_indices, space_indices])
+        true_discharges.append(scenario["q"][time_indices, space_indices])
+    zp, qp, zt, qt = map(np.concatenate, (predicted_water_levels, predicted_discharges, true_water_levels, true_discharges))
+    return {
+        "z_l2": 100 * np.linalg.norm(zp - zt) / np.linalg.norm(zt),
+        "q_l2": 100 * np.linalg.norm(qp - qt) / np.linalg.norm(qt),
+        "z_nse": 1 - np.sum((zp - zt) ** 2) / np.sum((zt - zt.mean()) ** 2),
+        "q_nse": 1 - np.sum((qp - qt) ** 2) / np.sum((qt - qt.mean()) ** 2),
     }
 
-    with (output_dir / "config.json").open("w", encoding="utf-8") as file:
-        json.dump(experiment_config, file, ensure_ascii=False, indent=2)
 
-    # 测试
-    # options = TrainOptions(data_section_indices=data_section_indices)
-    options = TrainOptions(
-            epochs=5,
-            physics_batch_size=32,
-            scenarios_per_batch=2,
-            eval_every=1,
-            save_every=5,
-            data_section_indices=data_section_indices,
+def train(model, pde, dataset, condition_standardizer, options, output_directory):
+    """执行模型训练、定期评估，并保存训练历史和最佳模型"""
+    optimizer = torch.optim.Adam(model.parameters(), lr=options.learning_rate)  # 优化器
+    loss_weights = torch.tensor(
+        (
+            options.initial_weight,
+            options.boundary_weight,
+            options.data_weight,
+            options.physics_weight * options.mass_weight,
+            options.physics_weight * options.momentum_weight,
+        ),
+        dtype=torch.float32,
+        device=compute_device,
+    )
+
+    history = (output_directory / "history.csv").open("w", newline="", encoding="utf-8")
+    writer = csv.writer(history)
+    writer.writerow(
+        (
+            "epoch", "loss", "initial", "boundary", "data", "mass", "momentum",
+            "weighted_initial", "weighted_boundary", "weighted_data",
+            "weighted_mass", "weighted_momentum",
+            "w_initial", "w_boundary", "w_data", "w_mass", "w_momentum", "test_q_nse",
+        )
+    )
+
+    best_q_nse = -float("inf")
+    # ============================== 训练循环 ==============================
+    for epoch in range(1, options.epochs + 1):
+        model.train()
+        shuffled_scenario_paths = np.random.permutation(dataset.train_files)    # 随机打乱训练场景顺序，按批次训练
+
+        scenario_loss_terms, weighted_loss_terms = [], []   # 场景损失项、加权损失项
+        batch_total_losses, batch_count = [], 0 # 批次总损失、批次数
+
+        # 按批次训练
+        for start in range(0, len(shuffled_scenario_paths), options.scenarios_per_batch):
+            optimizer.zero_grad()
+
+            batch_scenario_paths = shuffled_scenario_paths[start:start + options.scenarios_per_batch]   # 批次场景
+            batch_component_losses = [] # 批次组件损失项
+            # 计算批次中每个场景的损失项
+            for scenario_path in batch_scenario_paths:
+                # 计算场景条件向量并标准化
+                condition = to_tensor(condition_standardizer.transform(dataset.get_condition_vector(scenario_path)))
+                # 计算场景的初始、边界、数据及物理约束损失项(原始损失项,单值)
+                terms = loss_for_scenario(model, pde, dataset.load_scenario(scenario_path), condition, options)
+                batch_component_losses.append(terms)
+
+            component_losses = torch.stack(batch_component_losses).mean(0)  # 批次中每个场景的损失项平均值
+
+            if (
+                options.adaptive_weighting
+                and epoch >= options.weight_update_start
+                and epoch % options.weight_update_every == 0
+                and start == 0
+            ):
+                update_gradnorm_weights(
+                    component_losses, loss_weights, model,
+                    options.weight_update_rate,
+                    options.min_loss_weight,
+                    options.max_loss_weight,
+                )
+
+            batch_total_loss = torch.dot(loss_weights, component_losses)    # 加权损失
+            batch_total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), options.grad_clip)   # 梯度裁剪
+            optimizer.step()
+
+            # 记录批次损失项和总损失
+            scenario_loss_terms.extend([terms.detach() for terms in batch_component_losses])
+            weighted_loss_terms.extend([(loss_weights.detach() * terms.detach()) for terms in batch_component_losses])
+            batch_total_losses.append(batch_total_loss.detach())    # 加权损失
+
+            batch_count += 1
+
+        mean = (torch.stack(scenario_loss_terms).mean(0).cpu().numpy())   # 计算每个损失项的平均值
+        weighted_mean = (torch.stack(weighted_loss_terms).mean(0).cpu().numpy())   # 计算每个加权损失项的平均值
+        total_mean = torch.stack(batch_total_losses).mean().item()
+
+        # 评估模型在测试集和训练集上的表现
+        test = evaluate(model, dataset, condition_standardizer, dataset.test_files)
+        train_eval = evaluate(model, dataset, condition_standardizer, dataset.train_files)
+
+        # 保存最佳模型
+        if test and test["q_nse"] > best_q_nse:
+            best_q_nse = test["q_nse"]
+            torch.save(model.state_dict(), output_directory / "best.pt")
+
+        # 按固定列宽输出 epoch 日志块，便于横向比较
+        labels = ("IC", "BC", "Data", "Mass", "Mom")
+        header = "           " + "".join(f"{label:>14}" for label in labels)
+        raw_text = "raw      " + "".join(f"{value:14.2e}" for value in mean)
+        weight_text = "weight   " + "".join(
+            f"{value:14.2e}" for value in loss_weights.detach().cpu().tolist()
+        )
+        weighted_text = "weighted " + "".join(f"{value:14.2e}" for value in weighted_mean)
+        print(
+            f"\n----- epoch {epoch:4d} | total={total_mean:.2e} -----\n"
+            f"train: L2 Z/Q={train_eval['z_l2']:.2f}/{train_eval['q_l2']:.2f}% | "
+            f"NSE Z/Q={train_eval['z_nse']:.3f}/{train_eval['q_nse']:.3f}\n"
+            f"test : L2 Z/Q={test['z_l2']:.2f}/{test['q_l2']:.2f}% | "
+            f"NSE Z/Q={test['z_nse']:.3f}/{test['q_nse']:.3f}\n"
+            f"{header}\n{raw_text}\n{weight_text}\n{weighted_text}",
+            flush=True,
         )
 
-    train_operator_pinn(model, pde_residual, dataset, normalizer, scales, output_dir,options=options)
+        # 保存训练历史
+        writer.writerow(
+            (
+                epoch, total_mean, *mean, *weighted_mean,
+                *loss_weights.detach().cpu().tolist(),
+                "" if test is None else test["q_nse"],
+            )
+        )
+        history.flush()
+
+    history.close()
+    print(f"finished | best test Q-NSE {best_q_nse:.4f} | output {output_directory}")
+
+
+def main():
+    # 训练配置
+    random_seed = 2032; np.random.seed(random_seed); torch.manual_seed(random_seed)
+    if compute_device.type == "cuda":
+        torch.cuda.manual_seed_all(random_seed)
+    print(f"device = {compute_device}", flush=True)
+
+    # 初始化数据、几何、模型
+    dataset = ScenarioDataset(cache_directory)
+    condition_standardizer, scales = fit_condition_normalizer_and_scales(dataset)   # 计算条件向量标准化器和物理尺度
+    geometry = CrossSectionGeometry(
+        cross_section_profile_path,
+        to_tensor(dataset.load_scenario(dataset.train_files[0])["x"]),
+        device=compute_device,
+    )
+    model = OperatorPINN(scales, geometry).to(compute_device)
+    pde = PDE(geometry)
+
+    # 保存训练配置和物理尺度
+    output_directory = project_root / "outputs" / "flow_generalization_operator" / "operator_pinn_simple"
+    output_directory.mkdir(parents=True, exist_ok=True)
+    with (output_directory / "config.json").open("w", encoding="utf-8") as f:
+        json.dump({"options": TrainingOptions().__dict__, "scales": scales.__dict__.copy()}, f, ensure_ascii=False, indent=2)
+
+    # 启动训练
+    train(model, pde, dataset, condition_standardizer, TrainingOptions(), output_directory)
+
 
 if __name__ == "__main__":
     main()
