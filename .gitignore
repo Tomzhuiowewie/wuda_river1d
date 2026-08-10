@@ -9,6 +9,5 @@
 /river1d/training_dataset_cache
 /training_dataset
 /river1d/.vscode
-*.ipynb
 *.csv
 *.npz
