@@ -11,3 +11,4 @@
 /river1d/.vscode
 *.csv
 *.npz
+/experiments

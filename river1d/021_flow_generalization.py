@@ -25,8 +25,8 @@ project_root = Path(__file__).resolve().parent.parent
 cache_directory = project_root / "training_dataset_cache"
 cross_section_profile_path = CONFIG.cross_section_path
 manning_roughness = 0.016
-condition_time_points = 32
-condition_space_points = 16
+condition_time_points = 64
+condition_space_points = 32
 condition_input_dim = 2 * (condition_time_points + condition_space_points)
 
 
@@ -79,7 +79,7 @@ compute_device = select_device()
 class ScenarioDataset:
     """场景文件列表、训练/测试划分和内存缓存"""
 
-    def __init__(self, cache_directory, test_every=10, cache_limit=16):
+    def __init__(self, cache_directory, test_every=5, cache_limit=16):
         """初始化场景文件列表、训练测试划分及场景缓存"""
         self.cache_limit = cache_limit
         self.scenario_files = sorted(Path(cache_directory).glob("S*_hydrodynamics_all_sections_15min_warmup3.npz"))
@@ -89,7 +89,7 @@ class ScenarioDataset:
         self.condition_cache = {}
 
     def load_scenario(self, scenario_path):
-        """加载指定场景，并在缓存容量超限时移除最早缓存项"""
+        """加载指定场景（缓存容量超限时移除最早缓存项）"""
         scenario_path = Path(scenario_path)
         if scenario_path not in self.scenario_cache:
             raw = np.load(scenario_path)
@@ -106,7 +106,7 @@ class ScenarioDataset:
         return self.scenario_cache[scenario_path]
 
     def get_condition_vector(self, scenario_path):
-        """提取指定场景的边界和初始条件并组成条件向量："""
+        """构建条件向量：提取指定场景的边界和初始条件并组成条件向量"""
         scenario_path = Path(scenario_path)
         if scenario_path not in self.condition_cache:
             scenario = self.load_scenario(scenario_path)
@@ -114,8 +114,8 @@ class ScenarioDataset:
             space_indices = np.linspace(0, len(scenario["x"]) - 1, condition_space_points).round().astype(int)
             # 上游边界流量过程、下游边界水位条件、初始时刻的水位空间分布、初始时刻的流量空间分布
             self.condition_cache[scenario_path] = np.concatenate((
-                scenario["q"][:, 0][time_indices], scenario["z"][:, -1][time_indices],
-                scenario["z"][0, :][space_indices], scenario["q"][0, :][space_indices],
+                scenario["q"][:, 0][time_indices], scenario["z"][:, -1][time_indices],  # 边界条件：上游流量、下游水位
+                scenario["z"][0, :][space_indices], scenario["q"][0, :][space_indices], # 初始条件：水位场、流量场
             )).astype("float32")
         return self.condition_cache[scenario_path]
 
@@ -163,9 +163,9 @@ def fit_condition_normalizer_and_scales(dataset):
     reference_scenario = dataset.load_scenario(dataset.train_files[0])
 
     return ConditionStandardizer(np.stack(condition_vectors)), PhysicalScales(
-        reference_scenario,
-        np.concatenate(water_level_values),
-        np.concatenate(discharge_values),
+        reference_scenario, # 计算坐标尺度的参考场景
+        np.concatenate(water_level_values), # 计算水位尺度的训练集水位样本
+        np.concatenate(discharge_values),   # 计算流量尺度的训练集流量样本
     )
 
 
